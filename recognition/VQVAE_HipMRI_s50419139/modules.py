@@ -438,18 +438,23 @@ if __name__ == "__main__":
     # spread positions over many codes (perplexity 1.0 would mean collapse).
     assert ppl.item() > 10, f"codebook collapse at initialisation (perplexity {ppl.item():.1f})"
 
-    # Collapse-recovery test: feed near-identical vectors (everything maps to
-    # one code) for longer than the patience, then check codes were restarted
-    # and that varied inputs are again spread over many codes.
+    # Collapse-recovery test. Phase 1: near-identical encoder outputs for longer
+    # than the patience, so everything maps to one code and the other codes are
+    # restarted (onto those collapsed outputs). Phase 2: the encoder becomes
+    # varied again; within a few patience windows, codes left unused are
+    # restarted onto the new outputs and usage spreads out again.
     vq = VectorQuantizerEMA(num_embeddings=64, embedding_dim=8, restart_patience=5)
     vq.train()
     vq(torch.randn(4, 8, 8, 8))                     # data-dependent init
     for _ in range(8):
-        vq(0.01 * torch.randn(4, 8, 8, 8) + 5.0)    # collapsed encoder outputs
-    for _ in range(3):
+        _, _, _, ppl_collapsed = vq(0.01 * torch.randn(4, 8, 8, 8) + 5.0)
+    restarts_during_collapse = int(vq.restarts)
+    for _ in range(20):
         _, _, _, ppl_after = vq(torch.randn(4, 8, 8, 8) * 5.0 + 5.0)
-    print(f"Collapse recovery: restarts={int(vq.restarts)} perplexity_after={ppl_after.item():.1f}")
-    assert int(vq.restarts) > 0 and ppl_after.item() > 10, "dead-code restart did not recover from collapse"
+    print(f"Collapse recovery: perplexity collapsed={ppl_collapsed.item():.1f} -> recovered={ppl_after.item():.1f} "
+          f"(restarts: {restarts_during_collapse} during collapse, {int(vq.restarts)} total)")
+    assert restarts_during_collapse > 0, "no codes were restarted during collapse"
+    assert ppl_after.item() > 10, "codebook usage did not recover after collapse"
 
     vae = VAE()
     recon, mu, logvar = vae(x)
