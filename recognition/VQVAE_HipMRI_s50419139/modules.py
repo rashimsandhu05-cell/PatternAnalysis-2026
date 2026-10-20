@@ -17,6 +17,11 @@ Three networks are defined:
    The codebook is updated with exponential moving averages (EMA) of the encoder
    outputs assigned to each code (paper Appendix A.1) instead of a codebook
    loss term; this is more stable and less prone to unused ("dead") codes.
+   Two further guards against codebook collapse (found during testing: an
+   untrained model sent every position to one code, perplexity 1.0):
+   the codebook is initialised from real encoder outputs on the first training
+   batch, and codes whose usage decays below a threshold are restarted at
+   random encoder outputs from the current batch.
    The commitment loss beta * ||z_e - sg[e]||^2 (beta = 0.25) keeps encoder
    outputs close to their chosen codes. Gradients pass through the
    non-differentiable nearest-neighbour lookup with the straight-through
@@ -136,21 +141,60 @@ class VectorQuantizerEMA(nn.Module):
     """
 
     def __init__(self, num_embeddings: int = 512, embedding_dim: int = 64,
-                 beta: float = 0.25, decay: float = 0.99, eps: float = 1e-5):
+                 beta: float = 0.25, decay: float = 0.99, eps: float = 1e-5,
+                 dead_code_threshold: float = 1.0):
         super().__init__()
         self.K, self.D = num_embeddings, embedding_dim
         self.beta, self.decay, self.eps = beta, decay, eps
+        self.dead_code_threshold = dead_code_threshold
         embed = torch.randn(num_embeddings, embedding_dim)
         # Buffers, not Parameters: they are updated by EMA, not by the optimiser,
         # but are still saved in the state_dict.
         self.register_buffer("embedding", embed)
         self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
         self.register_buffer("ema_w", embed.clone())
+        self.register_buffer("initialised", torch.tensor(False))
+        self.register_buffer("restarts", torch.tensor(0))  # total dead-code restarts (for logging)
+
+    @torch.no_grad()
+    def _random_rows(self, flat, n):
+        """n random rows of flat (with replacement only if flat has fewer than n rows)."""
+        if flat.shape[0] >= n:
+            return flat[torch.randperm(flat.shape[0], device=flat.device)[:n]]
+        return flat[torch.randint(0, flat.shape[0], (n,), device=flat.device)]
+
+    @torch.no_grad()
+    def _init_from_data(self, flat):
+        """Data-dependent initialisation: codebook = K random encoder outputs."""
+        embed = self._random_rows(flat, self.K)
+        # Start each code at the usage it would have if all codes were used
+        # equally, so new codes are not restarted before they get a chance.
+        usage = flat.shape[0] / self.K
+        self.embedding.copy_(embed)
+        self.ema_cluster_size.fill_(usage)
+        self.ema_w.copy_(embed * usage)  # ema_w / cluster_size == embedding
+        self.initialised.fill_(True)
+
+    @torch.no_grad()
+    def _restart_dead_codes(self, flat):
+        """Move codes whose EMA usage fell below the threshold to random encoder outputs."""
+        dead = self.ema_cluster_size < self.dead_code_threshold
+        n_dead = int(dead.sum())
+        if n_dead == 0:
+            return
+        new = self._random_rows(flat, n_dead)
+        usage = flat.shape[0] / self.K
+        self.embedding[dead] = new
+        self.ema_cluster_size[dead] = usage
+        self.ema_w[dead] = new * usage
+        self.restarts += n_dead
 
     def forward(self, z_e):
         B, D, H, W = z_e.shape
         # (B, D, H, W) -> (B*H*W, D); float32 for stable distances under AMP
         flat = z_e.permute(0, 2, 3, 1).reshape(-1, D).float()
+        if self.training and not bool(self.initialised):
+            self._init_from_data(flat.detach())
 
         # Squared Euclidean distance to every code: |x|^2 - 2 x.e + |e|^2
         dist = (flat.pow(2).sum(1, keepdim=True)
@@ -169,6 +213,7 @@ class VectorQuantizerEMA(nn.Module):
                 n = self.ema_cluster_size.sum()
                 size = (self.ema_cluster_size + self.eps) / (n + self.K * self.eps) * n
                 self.embedding.copy_(self.ema_w / size.unsqueeze(1))
+                self._restart_dead_codes(flat.detach())
 
         z_e32 = z_e.float()
         commitment = F.mse_loss(z_e32, z_q.detach())
@@ -381,6 +426,9 @@ if __name__ == "__main__":
     assert vqvae.decode_indices(idx).shape == recon.shape
     print(f"VQVAE: params={count_parameters(vqvae):,} recon={tuple(recon.shape)} codes={tuple(idx.shape)} "
           f"vq_loss={vq_loss.item():.4f} perplexity={ppl.item():.1f}")
+    # With data-dependent initialisation, an untrained model should already
+    # spread positions over many codes (perplexity 1.0 would mean collapse).
+    assert ppl.item() > 10, f"codebook collapse at initialisation (perplexity {ppl.item():.1f})"
 
     vae = VAE()
     recon, mu, logvar = vae(x)
