@@ -1,0 +1,23 @@
+# --- Never commit data or model artefacts (spec Section 4.1) ---
+*.nii
+*.nii.gz
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+data/
+checkpoints/
+outputs/
+runs/
+audit_outputs/
+wandb/
+
+# --- Slurm / Python clutter ---
+slurm-*.out
+slurm-*.err
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Figures meant for the README go in images/ (NOT ignored).
