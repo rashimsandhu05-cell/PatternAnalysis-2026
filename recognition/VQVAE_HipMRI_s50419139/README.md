@@ -32,7 +32,24 @@ Key findings:
 - **Repeated scans per patient.** Patients contribute up to 480 slices across multiple weekly scans, so neighbouring training slices are highly similar. The memorisation audit accounts for this by comparing generated images against both training and held-out test patients.
 - **Limitation:** the test split contains only 3 patients, so test metrics carry patient-level variance and are reported with that caveat.
 
-<!-- TODO: normalisation details and split justification once dataset.py is written. -->
+### 3.2 Label verification
+
+The label meanings were confirmed visually before being used in evaluation (`python dataset.py` saves this figure). Label 2 covers the pelvic bones and femurs, label 3 the bladder, label 4 the rectum and label 5 the prostate, directly inferior to the bladder.
+
+![Label check](images/label_check.png)
+
+### 3.3 Pre-processing (`dataset.py`)
+
+1. **Crop.** Every slice is centre-cropped (or zero-padded) to 256×128. The 60 slices of width 144 lose 8 columns from each side, which are background.
+2. **Normalise.** Each slice is clipped to its own 0.5th–99.5th intensity percentiles and scaled to [0, 1]. MR intensities have no absolute scale, and percentile clipping stops a few very bright voxels from compressing the useful range.
+3. **Cache.** Pre-processed slices are cached as float16 tensors (about 1 GB, git-ignored), so later runs load in seconds instead of decoding about 12,700 Nifti files.
+4. **Masks** are cropped identically and used only for evaluation, never for training the generative models.
+
+After pre-processing, mean intensity is similar across splits (train 0.220, validate 0.236, test 0.213), so the held-out splits are not distribution-shifted. About 36% of slices contain prostate (train 36.2%, validate 38.5%, test 36.1%), so prostate-region metrics are computed only on those slices.
+
+### 3.4 Split justification
+
+The provided train / validate / test folders are used unchanged because the audit found no patient in more than one split. Slices from one patient are highly correlated (repeated weekly scans of the same anatomy), so a random slice-level split would leak patient anatomy into the test set and overstate both reconstruction quality and novelty in the memorisation audit.
 
 ## 4. Dependencies and Reproducibility
 <!-- Exact versions, seeds, hardware, how to run. -->
