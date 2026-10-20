@@ -1,6 +1,6 @@
 # VQ-VAE for Synthetic Prostate MRI Generation (HipMRI 2D)
 
-**Author:** <Your Name> (s50419139)
+**Author:** Rashim Kaur (s50419139)
 **Project:** COMP3710 Report, Section 2.4 Image Generation, VQ-VAE [Hard Difficulty]
 
 > Work in progress. Sections are filled in as the project develops.
