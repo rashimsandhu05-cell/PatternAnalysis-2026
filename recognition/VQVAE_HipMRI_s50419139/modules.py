@@ -20,8 +20,11 @@ Three networks are defined:
    Two further guards against codebook collapse (found during testing: an
    untrained model sent every position to one code, perplexity 1.0):
    the codebook is initialised from real encoder outputs on the first training
-   batch, and codes whose usage decays below a threshold are restarted at
-   random encoder outputs from the current batch.
+   batch, and any code not selected for `restart_patience` consecutive
+   training steps (default 50) is restarted at a random encoder output from
+   the current batch. (A first version restarted codes only once their EMA
+   usage decayed below 1, which took ~400 steps; a smoke test showed the
+   codebook collapsing to one code within 10 steps, long before that.)
    The commitment loss beta * ||z_e - sg[e]||^2 (beta = 0.25) keeps encoder
    outputs close to their chosen codes. Gradients pass through the
    non-differentiable nearest-neighbour lookup with the straight-through
@@ -142,11 +145,11 @@ class VectorQuantizerEMA(nn.Module):
 
     def __init__(self, num_embeddings: int = 512, embedding_dim: int = 64,
                  beta: float = 0.25, decay: float = 0.99, eps: float = 1e-5,
-                 dead_code_threshold: float = 1.0):
+                 restart_patience: int = 50):
         super().__init__()
         self.K, self.D = num_embeddings, embedding_dim
         self.beta, self.decay, self.eps = beta, decay, eps
-        self.dead_code_threshold = dead_code_threshold
+        self.restart_patience = restart_patience
         embed = torch.randn(num_embeddings, embedding_dim)
         # Buffers, not Parameters: they are updated by EMA, not by the optimiser,
         # but are still saved in the state_dict.
@@ -155,6 +158,8 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer("ema_w", embed.clone())
         self.register_buffer("initialised", torch.tensor(False))
         self.register_buffer("restarts", torch.tensor(0))  # total dead-code restarts (for logging)
+        # Consecutive training steps since each code was last selected
+        self.register_buffer("steps_unused", torch.zeros(num_embeddings, dtype=torch.long))
 
     @torch.no_grad()
     def _random_rows(self, flat, n):
@@ -176,9 +181,10 @@ class VectorQuantizerEMA(nn.Module):
         self.initialised.fill_(True)
 
     @torch.no_grad()
-    def _restart_dead_codes(self, flat):
-        """Move codes whose EMA usage fell below the threshold to random encoder outputs."""
-        dead = self.ema_cluster_size < self.dead_code_threshold
+    def _restart_dead_codes(self, flat, counts):
+        """Move codes unused for more than restart_patience steps to random encoder outputs."""
+        self.steps_unused = torch.where(counts > 0, torch.zeros_like(self.steps_unused), self.steps_unused + 1)
+        dead = self.steps_unused > self.restart_patience
         n_dead = int(dead.sum())
         if n_dead == 0:
             return
@@ -187,6 +193,7 @@ class VectorQuantizerEMA(nn.Module):
         self.embedding[dead] = new
         self.ema_cluster_size[dead] = usage
         self.ema_w[dead] = new * usage
+        self.steps_unused[dead] = 0
         self.restarts += n_dead
 
     def forward(self, z_e):
@@ -207,13 +214,14 @@ class VectorQuantizerEMA(nn.Module):
         if self.training:
             with torch.no_grad():
                 # Running count and running sum of encoder outputs per code
-                self.ema_cluster_size.mul_(self.decay).add_(one_hot.sum(0), alpha=1 - self.decay)
+                counts = one_hot.sum(0)
+                self.ema_cluster_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
                 self.ema_w.mul_(self.decay).add_(one_hot.t() @ flat, alpha=1 - self.decay)
                 # Laplace smoothing so unused codes never divide by zero
                 n = self.ema_cluster_size.sum()
                 size = (self.ema_cluster_size + self.eps) / (n + self.K * self.eps) * n
                 self.embedding.copy_(self.ema_w / size.unsqueeze(1))
-                self._restart_dead_codes(flat.detach())
+                self._restart_dead_codes(flat.detach(), counts)
 
         z_e32 = z_e.float()
         commitment = F.mse_loss(z_e32, z_q.detach())
@@ -429,6 +437,19 @@ if __name__ == "__main__":
     # With data-dependent initialisation, an untrained model should already
     # spread positions over many codes (perplexity 1.0 would mean collapse).
     assert ppl.item() > 10, f"codebook collapse at initialisation (perplexity {ppl.item():.1f})"
+
+    # Collapse-recovery test: feed near-identical vectors (everything maps to
+    # one code) for longer than the patience, then check codes were restarted
+    # and that varied inputs are again spread over many codes.
+    vq = VectorQuantizerEMA(num_embeddings=64, embedding_dim=8, restart_patience=5)
+    vq.train()
+    vq(torch.randn(4, 8, 8, 8))                     # data-dependent init
+    for _ in range(8):
+        vq(0.01 * torch.randn(4, 8, 8, 8) + 5.0)    # collapsed encoder outputs
+    for _ in range(3):
+        _, _, _, ppl_after = vq(torch.randn(4, 8, 8, 8) * 5.0 + 5.0)
+    print(f"Collapse recovery: restarts={int(vq.restarts)} perplexity_after={ppl_after.item():.1f}")
+    assert int(vq.restarts) > 0 and ppl_after.item() > 10, "dead-code restart did not recover from collapse"
 
     vae = VAE()
     recon, mu, logvar = vae(x)
