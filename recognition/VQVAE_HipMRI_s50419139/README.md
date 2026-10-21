@@ -125,7 +125,30 @@ After pre-processing, mean intensity is similar across splits (train 0.220, vali
 The provided train / validate / test folders are used unchanged because the audit found no patient in more than one split. Slices from one patient are highly correlated (repeated weekly scans of the same anatomy), so a random slice-level split would leak patient anatomy into the test set and overstate both reconstruction quality and novelty in the memorisation audit.
 
 ## 4. Dependencies and Reproducibility
-<!-- Exact versions, seeds, hardware, how to run. -->
+**Software.** All results were produced with the following versions (also pinned in `environment.yml`):
+
+| Package | Version | Used for |
+|---|---|---|
+| Python | 3.11.15 | |
+| PyTorch | 2.14.1 (CUDA 13.0) | models, training, metrics |
+| torchvision | 0.29.1 | installed with PyTorch (not imported by the project code) |
+| nibabel | 5.4.2 | reading Nifti slices |
+| NumPy | 2.4.6 | Nifti → tensor conversion, figures (not used in `modules.py`) |
+| scikit-image | 0.26.0 | reference SSIM in the `utils.py` self-test |
+| matplotlib | 3.11.2 | figures |
+| SciPy | 1.17.1 | scikit-image dependency |
+| tqdm | 4.70.1 | progress bars |
+
+```bash
+conda env create -f environment.yml
+conda activate comp3710
+```
+
+**Hardware.** Training and evaluation ran on one NVIDIA A100-PCIE-40GB on the UQ Rangpur cluster (`comp3710` partition), and pre-processing and self-tests on a CPU node. No model needs more than about 2 GB of GPU memory (Section 6.2), so any recent CUDA GPU should work.
+
+**Determinism.** Training uses seed 42 (`--seed`), and `predict.py` uses seed 0 for sampling. Data splits are fixed by the dataset folders, and pre-processing is deterministic (cached under a versioned file name, so a change to pre-processing cannot silently reuse a stale cache). GPU training uses bfloat16 autocast and non-deterministic cuDNN kernels, so re-running gives slightly different numbers (small differences in the last reported digit), but the same conclusions.
+
+**Reproducing the results.** Follow Section 5 in order: audit and cache the data, run the self-tests, train the VQ-VAE and the VAE, train the PixelCNN on the chosen VQ-VAE, then run `predict.py`. Exact commands and settings for every reported run are given with each result in Section 6.
 
 ## 5. Usage
 All commands are run from this folder. On Rangpur, GPU work is submitted with the Slurm scripts, and short checks run on a CPU node (`srun -p cpu --cpus-per-task=2 --time=00:30:00 --pty bash`). The data path defaults to `/home/groups/comp3710/HipMRI_Study_open/keras_slices_data`; pass `--root` to use another copy.
@@ -179,6 +202,16 @@ sbatch predict.sh --vqvae outputs/vqvae_e150/best.pt --out results/final
 ### 6.2 Resource Profiling
 ### 6.3 Memorisation and Privacy Audit
 ### 6.4 Failure Case Autopsy
+
+#### 6.4.1 Failures found and fixed during development
+
+Three failures were caught by self-tests and CPU smoke runs before they could affect the reported results. Each is kept here because it changed the design.
+
+| # | Symptom | Diagnosis | Fix | Evidence after fix |
+|---|---|---|---|---|
+| F1 | **Codebook collapse.** The untrained model mapped every position to one code (perplexity 1.0 of 512). After adding data-dependent initialisation, a smoke run still collapsed from perplexity 76 to 1.0 within 10 steps. | Early in training the encoder outputs move faster than the codebook can follow, so every output ends up nearest the same code. The first dead-code rule only restarted a code once its EMA usage fell below 1, which took about 400 steps. | Initialise the codebook from real encoder outputs, and restart any code unused for 50 consecutive steps at a random current encoder output. | Smoke run: perplexity 1.0 → 156 at the first restart, then 100–200. Full run: 376/512 codes in use. A self-test forces a collapse and checks recovery. |
+| F2 | **Incoherent samples.** The first PixelCNN produced realistic local texture but no coherent pelvis (scattered bones, one-sided black regions). | Receptive field: 12 gated layers with 3×3 kernels let each position see only 14 of the 32 code rows above it, so the lower half of a slice was generated without seeing the upper half. | 15 layers with 5×5 kernels (receptive field of 31 rows, i.e. the whole grid), plus dropout 0.1 against the overfitting seen in v1 (validation NLL minimum at epoch ~15, then rising). | Best validation NLL 4.588 → 4.577 nats/code. Visual comparison in Section 6.3. |
+| F3 | **SSIM-loss runs failed.** Adding 0.1·(1 − SSIM) to the loss gave best validation SSIM 0.178 and 0.054, against 0.747 without it. Loss and validation SSIM were flat from epoch 1 (0.19 and 0.162). | SSIM was computed inside the bfloat16 autocast region. Its variance terms are differences of nearly equal numbers (E[x²] − E[x]²), which bfloat16 (~3 significant digits) gets badly wrong, so the SSIM gradient was meaningless and stopped the model learning. | Compute SSIM in float32 with autocast disabled. Training now also stops immediately on a non-finite loss. | <!-- TODO: rerun results (jobs 683668, 683669) --> |
 ### 6.5 Recommendation to Project Manager
 
 ## 7. Artificial Intelligence Usage Disclosure
