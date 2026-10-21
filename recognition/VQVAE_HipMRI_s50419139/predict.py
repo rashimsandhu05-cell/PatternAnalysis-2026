@@ -362,6 +362,15 @@ def nearest_neighbours(queries, ref, device, bs=128):
 
 
 @torch.no_grad()
+def pair_ssim(a, ref, idx, bs=256):
+    """SSIM between a[i] and ref[idx[i]] for every i (nearest neighbour found by RMSE)."""
+    out = []
+    for i in range(0, len(a), bs):
+        out.append(ssim(a[i:i + bs].float(), ref[idx[i:i + bs]].float()))
+    return torch.cat(out)
+
+
+@torch.no_grad()
 def max_code_overlap(queries, ref, device, bs=16):
     """Largest fraction of identical code positions between each query grid and any reference grid."""
     R = ref.flatten(1).to(device)
@@ -376,20 +385,32 @@ def task_memorisation(models, samples, test, train, device, out, report):
     # Training images stay float16 on the CPU (a float32 copy would need ~1.5 GB
     # extra RAM); nearest_neighbours converts each block to float32 on the device.
     test_x, train_x = test.images.float(), train.images
-    d_test, _ = nearest_neighbours(test_x, train_x, device)
+    d_test, j_test = nearest_neighbours(test_x, train_x, device)
     tau = torch.quantile(d_test, 0.05).item()
+    ssim_test_train = pair_ssim(test_x, train_x, j_test)
     result = {"tau_rmse_5th_pct_test_to_train": tau,
-              "test_to_train_rmse": {"median": d_test.median().item(), "min": d_test.min().item()}}
+              "test_to_train_rmse": {"median": d_test.median().item(), "min": d_test.min().item()},
+              "test_to_train_ssim": {"median": ssim_test_train.median().item(),
+                                     "max": ssim_test_train.max().item()}}
     nn_by_model = {}
     for name, imgs in samples.items():
         d_tr, j_tr = nearest_neighbours(imgs, train_x, device)
-        d_te, _ = nearest_neighbours(imgs, test_x, device)
+        d_te, j_te = nearest_neighbours(imgs, test_x, device)
         nn_by_model[name] = (d_tr, j_tr)
+        # Plausibility (spec: SSIM > 0.6 across synthesised cohorts against reference
+        # slices): SSIM between each sample and its nearest real *held-out* slice.
+        s_te = pair_ssim(imgs, test_x, j_te)
+        s_tr = pair_ssim(imgs, train_x, j_tr)
         result[name] = {
             "gen_to_train_rmse_median": d_tr.median().item(),
             "gen_to_train_rmse_min": d_tr.min().item(),
             "gen_to_test_rmse_median": d_te.median().item(),
             "frac_below_tau": (d_tr < tau).float().mean().item(),
+            "nn_test_ssim_median": s_te.median().item(),
+            "nn_test_ssim_mean": s_te.mean().item(),
+            "frac_nn_test_ssim_above_0.6": (s_te > 0.6).float().mean().item(),
+            "nn_train_ssim_median": s_tr.median().item(),
+            "nn_train_ssim_max": s_tr.max().item(),
         }
 
     # Code-level copying (VQ-VAE only): do sampled code grids reuse whole training grids?
@@ -446,7 +467,15 @@ def task_memorisation(models, samples, test, train, device, out, report):
              f"| Min NN RMSE | {d_test.min():.4f} | " +
              " | ".join(f"{result[n]['gen_to_train_rmse_min']:.4f}" for n in nn_by_model) + " |",
              f"| Fraction below τ = {tau:.4f} | 5% (by definition) | " +
-             " | ".join(f"{result[n]['frac_below_tau']:.1%}" for n in nn_by_model) + " |"]
+             " | ".join(f"{result[n]['frac_below_tau']:.1%}" for n in nn_by_model) + " |",
+             f"| Median SSIM to nearest training slice | {ssim_test_train.median():.3f} | " +
+             " | ".join(f"{result[n]['nn_train_ssim_median']:.3f}" for n in nn_by_model) + " |",
+             f"| Max SSIM to nearest training slice | {ssim_test_train.max():.3f} | " +
+             " | ".join(f"{result[n]['nn_train_ssim_max']:.3f}" for n in nn_by_model) + " |",
+             "| **Plausibility:** median SSIM to nearest real test slice | n/a | " +
+             " | ".join(f"{result[n]['nn_test_ssim_median']:.3f}" for n in nn_by_model) + " |",
+             "| Samples with SSIM > 0.6 to nearest real test slice | n/a | " +
+             " | ".join(f"{result[n]['frac_nn_test_ssim_above_0.6']:.1%}" for n in nn_by_model) + " |"]
     if "code_overlap_gen_median" in result.get("vqvae", {}):
         v = result["vqvae"]
         lines.append(f"\nVQ-VAE code-grid copying: the most similar training grid shares a median of "
