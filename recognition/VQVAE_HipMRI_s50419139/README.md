@@ -6,7 +6,53 @@
 > Work in progress. Sections are filled in as the project develops.
 
 ## 1. Problem and Algorithm Overview
-<!-- One paragraph on the problem, one on how VQ-VAE works, plus a figure. -->
+### 1.1 The problem
+
+Prostate cancer radiotherapy research needs large sets of pelvic MR scans, but patient scans cannot be shared freely. A generative model that produces *synthetic* scans could, in principle, be shared instead. This creates a dilemma. If the model **memorises** its training patients, sharing its output leaks their anatomy and breaches confidentiality. If it **hallucinates** implausible anatomy, models trained on the synthetic cohort learn dangerous artefacts. This project builds a VQ-VAE generator for 2D coronal slices from the HipMRI prostate study and tests, with evidence, whether its output is faithful, diverse and non-memorised, compared with a simpler VAE baseline.
+
+### 1.2 How the VQ-VAE works
+
+A **VQ-VAE** (van den Oord et al., 2017) is an autoencoder whose latent space is *discrete*:
+
+1. **Encoder.** Three stride-2 convolutions and two residual blocks map a 1×256×128 slice to a 32×16 grid of 64-dimensional vectors $z_e$.
+2. **Vector quantiser.** Each vector is replaced by its nearest entry in a learned **codebook** of 512 vectors, $z_q = e_k$ with $k = \arg\min_j \lVert z_e - e_j \rVert_2$, so a slice becomes a 32×16 grid of integers.
+3. **Decoder.** It mirrors the encoder (residual blocks, then transposed convolutions and a sigmoid) to rebuild the slice from $z_q$.
+
+The training loss is
+
+$$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \, \lVert z_e - \mathrm{sg}[z_q] \rVert_2^2,$$
+
+where sg is the stop-gradient operator and β = 0.25. The first term trains the decoder and encoder to reconstruct the slice. The second (the **commitment loss**) keeps encoder outputs close to their chosen codes. The argmin is not differentiable, so gradients are copied from $z_q$ to $z_e$ with the **straight-through estimator** ($z_q \leftarrow z_e + \mathrm{sg}[z_q - z_e]$). Instead of a codebook loss term, the codebook is updated with **exponential moving averages** of the encoder outputs assigned to each code (paper Appendix A.1). Two further measures prevent **codebook collapse**, a failure observed during development (Section 6.4): the codebook is initialised from real encoder outputs, and codes unused for 50 steps are restarted at random encoder outputs.
+
+**Generating new slices** needs a model of *which code grids are plausible*. A **Gated PixelCNN** prior (van den Oord et al., 2016) is trained on the code grids of the training set to predict each code from the codes above and to the left of it. Sampling a grid code by code and passing it through the decoder produces a new slice.
+
+**Baseline.** A convolutional **VAE** (Kingma & Welling, 2014) uses the same encoder/decoder backbone, but its latent is a continuous Gaussian (8 channels on the same 32×16 grid). It is trained with summed squared error plus a KL term, with the KL weight warmed up over 5 epochs (Bowman et al., 2016), and it generates by decoding $z \sim \mathcal{N}(0, I)$. Because the backbone is shared, the comparison isolates the effect of discrete versus continuous latents.
+
+```mermaid
+flowchart LR
+    X["MR slice<br/>1×256×128"] --> E["Encoder<br/>3× stride-2 conv<br/>+ residual blocks"]
+    E --> ZE["z_e<br/>64×32×16"]
+    ZE --> Q{"Nearest code<br/>(512×64 codebook,<br/>EMA updates)"}
+    Q --> ZQ["z_q<br/>codes 32×16"]
+    ZQ --> D["Decoder<br/>residual blocks<br/>+ 3× transposed conv"]
+    D --> XH["Reconstruction<br/>1×256×128"]
+    ZQ -. "code grids of training set" .-> P["Gated PixelCNN prior<br/>p(codes)"]
+    P -. "sample new grid" .-> D
+```
+
+*Solid arrows: reconstruction (stage 1, trained first). Dotted arrows: generation (stage 2, prior trained on frozen codes).*
+
+### 1.3 Repository structure
+
+| File | Purpose |
+|---|---|
+| `dataset.py` | Loads Nifti slices, centre-crops to 256×128, normalises each slice, caches tensors, builds DataLoaders |
+| `modules.py` | VQ-VAE (encoder, EMA vector quantiser, decoder), VAE baseline, Gated PixelCNN prior. Running it executes the self-tests |
+| `train.py` | Training/validation loops for all three models, checkpoints, curves and logs of time and peak GPU memory |
+| `predict.py` | Loads trained weights and runs the test-set evaluation, failure analysis, sampling, memorisation audit, interpolation and profiling |
+| `utils.py` | SSIM (validated against scikit-image), PSNR, masked SSIM, seeding and figure helpers |
+| `data_audit.py` | Pre-training dataset audit (shapes, intensities, labels, image/mask pairing, patient leakage) |
+| `train.sh`, `predict.sh` | Slurm job scripts for the Rangpur cluster |
 
 ## 2. Feasibility Review (Midpoint Check-Off)
 *Written for the compulsory midpoint check-off. Evidence reflects the state of the project at that point (first full training runs complete).*
@@ -82,7 +128,51 @@ The provided train / validate / test folders are used unchanged because the audi
 <!-- Exact versions, seeds, hardware, how to run. -->
 
 ## 5. Usage
-<!-- Commands for train.py and predict.py, with example inputs and outputs. -->
+All commands are run from this folder. On Rangpur, GPU work is submitted with the Slurm scripts, and short checks run on a CPU node (`srun -p cpu --cpus-per-task=2 --time=00:30:00 --pty bash`). The data path defaults to `/home/groups/comp3710/HipMRI_Study_open/keras_slices_data`; pass `--root` to use another copy.
+
+**1. Audit the data and build the cache** (CPU, a few minutes on first run):
+
+```bash
+python data_audit.py          # prints the audit, saves audit_outputs/sample_slices.png
+python dataset.py             # caches pre-processed tensors to data/cache/, saves audit_outputs/label_check.png
+```
+
+**2. Run the self-tests** (CPU, under a minute). These check shapes, codebook initialisation, recovery from codebook collapse, PixelCNN causality, and SSIM against scikit-image:
+
+```bash
+python modules.py
+python utils.py
+```
+
+**3. Smoke-test training** (CPU, a few batches; catches bugs before using GPU time):
+
+```bash
+python train.py --model vqvae --smoke
+python train.py --model vae --smoke
+python train.py --model pixelcnn --smoke
+```
+
+**4. Train on a GPU.** The PixelCNN must be trained after the VQ-VAE, because it learns the VQ-VAE's code grids:
+
+```bash
+sbatch train.sh vqvae --epochs 150                  # -> outputs/vqvae/
+sbatch train.sh vae                                 # -> outputs/vae/
+sbatch --dependency=afterok:<vqvae_job_id> train.sh pixelcnn
+```
+
+Useful options: `--out-dir`, `--epochs`, `--batch-size`, `--lr`, `--n-down` (3 gives a 32×16 code grid, 2 gives 64×32), `--ssim-weight`, `--num-embeddings`, `--prior-layers`, `--prior-kernel`. Each run writes `best.pt`, `last.pt`, `history.json`, `summary.json`, `curves.png` and `recon_latest.png` to its output folder.
+
+**5. Evaluate on the test split and generate samples:**
+
+```bash
+sbatch predict.sh                                   # all tasks -> results/
+sbatch predict.sh --tasks evaluate,failures         # a subset
+sbatch predict.sh --vqvae outputs/vqvae_e150/best.pt --out results/final
+```
+
+`predict.py` writes all tables to `results/report.md` and figures to `results/`. Model weights, caches and results are not committed (see `.gitignore`); figures used in this README are copied to `images/`.
+
+<!-- TODO: example input/output figures once the final model is chosen. -->
 
 ## 6. Results
 ### 6.1 Baseline (VAE) vs VQ-VAE
@@ -92,6 +182,30 @@ The provided train / validate / test folders are used unchanged because the audi
 ### 6.5 Recommendation to Project Manager
 
 ## 7. Artificial Intelligence Usage Disclosure
-<!-- Tools used, tasks assisted, how outputs were verified. -->
+> **DRAFT. Rashim: edit this so that every statement is accurate before submission.** Add any other tools you used (e.g. GitHub Copilot or ChatGPT), and describe in your own words which parts you wrote or changed yourself.
+
+**Tools used.** Claude (Anthropic), used through the Claude app as a coding and writing assistant throughout the project.
+
+**What it was used for.**
+- Interpreting the assessment specification and planning the project (model choice, baseline, investigation design).
+- Drafting the code in all project files (`data_audit.py`, `dataset.py`, `modules.py`, `train.py`, `predict.py`, `utils.py`, Slurm scripts).
+- Debugging: diagnosing codebook collapse, the bfloat16 SSIM-loss failure, the Slurm partition/account error, and git/VPN set-up problems.
+- Drafting README text, including the feasibility review.
+
+**How outputs were verified.**
+- Every model file has executable self-tests that were run on Rangpur: output shapes, PixelCNN causality (perturbing one code must not change any earlier prediction), recovery from a forced codebook collapse, and SSIM agreement with `skimage.metrics.structural_similarity` (difference < 1e-4).
+- Every training path was run as a CPU smoke test before any GPU job. This caught two real bugs (codebook collapse within 10 steps, and the SSIM loss failing under bfloat16 autocast), and both fixes were confirmed by re-running.
+- The data audit and label overlays were checked visually against the anatomy (bladder, rectum, prostate and bones in the expected positions).
+- All reported numbers come from logged runs (`history.json`, `summary.json`, `results/report.md`), not from the assistant. Model selection used the validation split only, and the test split was used once for the final evaluation.
+- I read and ran all of the code, and can explain each component (quantiser, straight-through estimator, EMA updates, gated masked convolutions, the memorisation criterion).
 
 ## 8. References
+
+1. A. van den Oord, O. Vinyals and K. Kavukcuoglu, "Neural Discrete Representation Learning," *NeurIPS*, 2017. arXiv:1711.00937.
+2. A. van den Oord, N. Kalchbrenner, O. Vinyals, L. Espeholt, A. Graves and K. Kavukcuoglu, "Conditional Image Generation with PixelCNN Decoders," *NeurIPS*, 2016. arXiv:1606.05328.
+3. D. P. Kingma and M. Welling, "Auto-Encoding Variational Bayes," *ICLR*, 2014. arXiv:1312.6114.
+4. S. R. Bowman, L. Vilnis, O. Vinyals, A. M. Dai, R. Jozefowicz and S. Bengio, "Generating Sentences from a Continuous Space," *CoNLL*, 2016. arXiv:1511.06349.
+5. Z. Wang, A. C. Bovik, H. R. Sheikh and E. P. Simoncelli, "Image Quality Assessment: From Error Visibility to Structural Similarity," *IEEE Transactions on Image Processing*, 13(4), 2004.
+6. P. Dhariwal, H. Jun, C. Payne, J. W. Kim, A. Radford and I. Sutskever, "Jukebox: A Generative Model for Music," 2020. arXiv:2005.00341. (Random restarts of unused codes.)
+7. C. Meehan, K. Chaudhuri and S. Dasgupta, "A Non-Parametric Test to Detect Data-Copying in Generative Models," *AISTATS*, 2020. arXiv:2004.05675.
+8. J. Dowling and P. Greer, "Labelled weekly MR images of the male pelvis," CSIRO Data Collection, v2, 2021. doi:10.25919/45t8-p065.
