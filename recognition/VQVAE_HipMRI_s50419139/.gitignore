@@ -21,3 +21,6 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Figures meant for the README go in images/ (NOT ignored).
+
+# Evaluation outputs from predict.py (selected figures are copied to images/)
+results/
