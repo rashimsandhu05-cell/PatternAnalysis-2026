@@ -1,0 +1,18 @@
+# Conda environment used for all results in this project (Rangpur, NVIDIA A100).
+# Create with:  conda env create -f environment.yml && conda activate comp3710
+name: comp3710
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.14.1
+      - torchvision==0.29.1
+      - nibabel==5.4.2
+      - scikit-image==0.26.0
+      - matplotlib==3.11.2
+      - numpy==2.4.6
+      - scipy==1.17.1
+      - tqdm==4.70.1
