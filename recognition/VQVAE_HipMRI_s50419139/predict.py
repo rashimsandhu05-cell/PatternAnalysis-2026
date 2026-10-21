@@ -526,7 +526,7 @@ def task_profile(models, prior, args, test, device, out, report):
             gen_mem = peak_memory_mb(device)
         else:
             gen, gen_mem = float("nan"), float("nan")
-        train_summary = Path(f"outputs/{name}/summary.json")
+        train_summary = Path(getattr(args, name)).parent / "summary.json"
         ts = json.loads(train_summary.read_text()) if train_summary.exists() else {}
         prof[name] = {
             "params": count_parameters(model) + (count_parameters(prior) if name == "vqvae" and prior else 0),
@@ -540,7 +540,7 @@ def task_profile(models, prior, args, test, device, out, report):
             "train_peak_mem_mb": ts.get("peak_gpu_mem_mb"),
         }
         if name == "vqvae":
-            ps = Path("outputs/pixelcnn/summary.json")
+            ps = Path(args.prior).parent / "summary.json"
             if ps.exists():
                 pj = json.loads(ps.read_text())
                 prof[name]["prior_train_time_s"] = pj.get("total_train_time_s")

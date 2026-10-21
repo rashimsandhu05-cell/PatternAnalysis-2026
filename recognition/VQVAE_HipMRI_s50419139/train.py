@@ -23,7 +23,8 @@ in predict.py so that model selection cannot leak into the reported results.
 
 Losses
 ------
-VQ-VAE : mean squared error (per pixel) + vq_loss (beta * commitment loss).
+VQ-VAE : mean squared error (per pixel) + vq_loss (beta * commitment loss)
+         [+ ssim_weight * (1 - SSIM) if --ssim-weight > 0].
          The codebook itself is updated by EMA inside the quantiser.
 VAE    : sum-over-pixels squared error per image + kl_weight * KL, with the KL
          weight warmed up linearly over the first epochs to avoid posterior
@@ -66,6 +67,11 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--no-amp", action="store_true", help="disable bfloat16 autocast on GPU")
     p.add_argument("--smoke", action="store_true", help="tiny run to check the code path")
+    # Shared autoencoder architecture
+    p.add_argument("--n-down", type=int, default=3,
+                   help="stride-2 downsamplings: 3 -> 32x16 latent grid, 2 -> 64x32")
+    p.add_argument("--hidden", type=int, default=128, help="encoder/decoder width")
+    p.add_argument("--ssim-weight", type=float, default=0.0, help="add ssim_weight * (1 - SSIM) to the loss")
     # VQ-VAE
     p.add_argument("--num-embeddings", type=int, default=512)
     p.add_argument("--embedding-dim", type=int, default=64)
@@ -158,11 +164,12 @@ def evaluate_reconstruction(model, loader, device, amp, max_batches=None):
 
 def train_autoencoder(args, device, out):
     loaders = get_dataloaders(args.root, args.cache_dir, args.batch_size, args.num_workers)
+    arch = {"hidden": args.hidden, "n_down": args.n_down}
     if args.model == "vqvae":
-        model_kwargs = {"num_embeddings": args.num_embeddings, "embedding_dim": args.embedding_dim}
+        model_kwargs = {"num_embeddings": args.num_embeddings, "embedding_dim": args.embedding_dim, **arch}
         model = VQVAE(**model_kwargs)
     else:
-        model_kwargs = {"latent_channels": args.latent_channels}
+        model_kwargs = {"latent_channels": args.latent_channels, **arch}
         model = VAE(**model_kwargs)
     model.to(device)
     print(f"{args.model}: {count_parameters(model):,} trainable parameters on {device}")
@@ -192,6 +199,8 @@ def train_autoencoder(args, device, out):
                     recon = recon.float()
                     rec = F.mse_loss(recon, x)
                     loss = rec + vq_loss
+                    if args.ssim_weight > 0:
+                        loss = loss + args.ssim_weight * (1 - ssim(recon, x).mean())
                     extras = {"vq_loss": vq_loss.item(), "perplexity": perplexity.item()}
                 else:
                     recon, mu, logvar = model(x)
@@ -200,6 +209,9 @@ def train_autoencoder(args, device, out):
                     kl = VAE.kl_divergence(mu.float(), logvar.float())
                     kl_w = args.kl_weight * min(1.0, (step + 1) / warmup_steps)
                     loss = rec + kl_w * kl
+                    if args.ssim_weight > 0:
+                        # scaled by pixel count to match the summed reconstruction term
+                        loss = loss + args.ssim_weight * x[0].numel() * (1 - ssim(recon, x).mean())
                     extras = {"kl": kl.item(), "kl_weight": kl_w}
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -250,6 +262,7 @@ def train_autoencoder(args, device, out):
         save_image_grid(samples, out / "samples.png", title="VAE samples, z ~ N(0, I)")
 
     summary = {"model": args.model, "params": count_parameters(model), "best_val_ssim": best,
+               "model_kwargs": model_kwargs, "epochs": args.epochs, "ssim_weight": args.ssim_weight,
                "total_train_time_s": time.time() - train_start,
                "peak_gpu_mem_mb": max(h["peak_gpu_mem_mb"] for h in history)}
     save_json(summary, out / "summary.json")
