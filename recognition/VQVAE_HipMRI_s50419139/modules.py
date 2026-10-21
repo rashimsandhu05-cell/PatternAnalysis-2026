@@ -324,10 +324,11 @@ class GatedMaskedConv2d(nn.Module):
     information about earlier positions.
     """
 
-    def __init__(self, mask_type: str, dim: int, kernel: int = 3, residual: bool = True):
+    def __init__(self, mask_type: str, dim: int, kernel: int = 3, residual: bool = True, dropout: float = 0.0):
         super().__init__()
         assert mask_type in ("A", "B") and kernel % 2 == 1
         self.mask_type, self.residual = mask_type, residual
+        self.dropout = nn.Dropout(dropout)
         k2 = kernel // 2
         # Vertical: kernel (k2 + 1) x kernel covers the current row and k2 rows above
         self.vert = nn.Conv2d(dim, 2 * dim, (k2 + 1, kernel), padding=(k2, k2))
@@ -361,23 +362,34 @@ class GatedMaskedConv2d(nn.Module):
                        padding=self.horiz.padding)[:, :, :, :W]
 
         out_v = self._gate(h_v)
-        out_h = self.horiz_out(self._gate(h_h + self.vert_to_horiz(h_v)))
+        out_h = self.horiz_out(self.dropout(self._gate(h_h + self.vert_to_horiz(h_v))))
         if self.residual:
             out_h = out_h + x_h
         return out_v, out_h
 
 
 class GatedPixelCNN(nn.Module):
-    """Autoregressive prior p(codes) = prod_i p(c_i | c_<i) over a code grid."""
+    """Autoregressive prior p(codes) = prod_i p(c_i | c_<i) over a code grid.
 
-    def __init__(self, num_embeddings: int = 512, dim: int = 128, n_layers: int = 12):
+    Receptive field: the first layer (7x7) reaches 3 rows up; each later layer
+    with kernel k reaches k // 2 further rows. Version 1 (12 layers, k = 3)
+    reached only 14 of the 32 rows, so the lower half of a slice was generated
+    without seeing the upper half and samples lacked global anatomy. The
+    training defaults are now 15 layers with k = 5, which reach 31 rows (the
+    whole grid). See receptive_rows().
+    """
+
+    def __init__(self, num_embeddings: int = 512, dim: int = 128, n_layers: int = 12,
+                 kernel: int = 3, dropout: float = 0.0):
         super().__init__()
         self.K = num_embeddings
+        self.n_layers, self.kernel = n_layers, kernel
         self.embedding = nn.Embedding(num_embeddings, dim)
         # First layer is type A and has no residual (the residual would leak the
         # current code straight to the output).
-        layers = [GatedMaskedConv2d("A", dim, kernel=7, residual=False)]
-        layers += [GatedMaskedConv2d("B", dim, kernel=3, residual=True) for _ in range(n_layers - 1)]
+        layers = [GatedMaskedConv2d("A", dim, kernel=7, residual=False, dropout=dropout)]
+        layers += [GatedMaskedConv2d("B", dim, kernel=kernel, residual=True, dropout=dropout)
+                   for _ in range(n_layers - 1)]
         self.layers = nn.ModuleList(layers)
         self.output = nn.Sequential(nn.ReLU(), nn.Conv2d(dim, 512, 1), nn.ReLU(), nn.Conv2d(512, num_embeddings, 1))
 
@@ -388,6 +400,10 @@ class GatedPixelCNN(nn.Module):
         for layer in self.layers:
             x_v, x_h = layer(x_v, x_h)
         return self.output(x_h)
+
+    def receptive_rows(self) -> int:
+        """How many rows above the current one the vertical stack can see."""
+        return 3 + (self.n_layers - 1) * (self.kernel // 2)
 
     @torch.no_grad()
     def sample(self, n: int, h: int, w: int, device, temperature: float = 1.0):
@@ -462,13 +478,15 @@ if __name__ == "__main__":
     print(f"VAE:   params={count_parameters(vae):,} recon={tuple(recon.shape)} latent={tuple(mu.shape)} "
           f"kl={VAE.kl_divergence(mu, logvar).item():.2f} sample={tuple(vae.sample(2, 256, 128, 'cpu').shape)}")
 
-    prior = GatedPixelCNN()
-    logits = prior(idx)
-    assert logits.shape == (2, 512, 32, 16)
-    print(f"PixelCNN: params={count_parameters(prior):,} logits={tuple(logits.shape)}")
+    for cfg in ({"n_layers": 12, "kernel": 3}, {"n_layers": 15, "kernel": 5, "dropout": 0.1}):
+        prior = GatedPixelCNN(**cfg)
+        logits = prior(idx)
+        assert logits.shape == (2, 512, 32, 16)
+        print(f"PixelCNN {cfg}: params={count_parameters(prior):,} logits={tuple(logits.shape)} "
+              f"receptive_rows={prior.receptive_rows()} of 32")
 
-    small = GatedPixelCNN(num_embeddings=16, dim=16, n_layers=4)
-    ok = check_pixelcnn_causality(small)
+    ok = (check_pixelcnn_causality(GatedPixelCNN(num_embeddings=16, dim=16, n_layers=4, kernel=3))
+          and check_pixelcnn_causality(GatedPixelCNN(num_embeddings=16, dim=16, n_layers=4, kernel=5)))
     print(f"PixelCNN causality check: {'PASS' if ok else 'FAIL'}")
     assert ok
     print("All self-tests passed.")

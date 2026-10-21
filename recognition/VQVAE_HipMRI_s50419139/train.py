@@ -76,7 +76,9 @@ def parse_args():
     # PixelCNN
     p.add_argument("--vqvae-ckpt", default=None, help="default: outputs/vqvae/best.pt")
     p.add_argument("--prior-dim", type=int, default=128)
-    p.add_argument("--prior-layers", type=int, default=12)
+    p.add_argument("--prior-layers", type=int, default=15)
+    p.add_argument("--prior-kernel", type=int, default=5, help="kernel size of the type-B gated layers")
+    p.add_argument("--prior-dropout", type=float, default=0.1)
     p.add_argument("--n-samples", type=int, default=16, help="slices to generate at the end (pixelcnn)")
     args = p.parse_args()
 
@@ -302,9 +304,11 @@ def train_pixelcnn(args, device, out):
     train_loader = DataLoader(TensorDataset(train_codes), batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(TensorDataset(val_codes), batch_size=args.batch_size)
 
-    model_kwargs = {"num_embeddings": K, "dim": args.prior_dim, "n_layers": args.prior_layers}
+    model_kwargs = {"num_embeddings": K, "dim": args.prior_dim, "n_layers": args.prior_layers,
+                    "kernel": args.prior_kernel, "dropout": args.prior_dropout}
     prior = GatedPixelCNN(**model_kwargs).to(device)
-    print(f"pixelcnn: {count_parameters(prior):,} trainable parameters on {device}")
+    print(f"pixelcnn: {count_parameters(prior):,} trainable parameters on {device}; "
+          f"receptive field {prior.receptive_rows()} rows of {train_codes.shape[1]}")
 
     max_train = SMOKE_TRAIN_BATCHES if args.smoke else None
     max_val = SMOKE_VAL_BATCHES if args.smoke else None
@@ -365,6 +369,7 @@ def train_pixelcnn(args, device, out):
 
     summary = {"model": "pixelcnn", "params": count_parameters(prior), "best_val_nll": best,
                "best_val_bits_per_code": best / math.log(2), "codes_used_in_train": used,
+               "receptive_rows": prior.receptive_rows(),
                "sampling_time_per_slice_s": gen_time, "total_train_time_s": time.time() - train_start,
                "peak_gpu_mem_mb": max(r["peak_gpu_mem_mb"] for r in history)}
     save_json(summary, out / "summary.json")
