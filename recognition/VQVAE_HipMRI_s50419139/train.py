@@ -213,6 +213,8 @@ def train_autoencoder(args, device, out):
                         # scaled by pixel count to match the summed reconstruction term
                         loss = loss + args.ssim_weight * x[0].numel() * (1 - ssim(recon, x).mean())
                     extras = {"kl": kl.item(), "kl_weight": kl_w}
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss ({loss.item()}) at epoch {epoch}, step {step}; stopping.")
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -341,6 +343,8 @@ def train_pixelcnn(args, device, out):
             with autocast(device, amp):
                 logits = prior(codes)
             loss = F.cross_entropy(logits.float(), codes)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss ({loss.item()}) at epoch {epoch}; stopping.")
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()

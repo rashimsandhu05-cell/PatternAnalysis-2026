@@ -39,8 +39,19 @@ def _gaussian_window(device, dtype, size: int = SSIM_WINDOW, sigma: float = SSIM
 
 
 def ssim_map(x, y, data_range: float = 1.0):
-    """Per-pixel SSIM map, same size as the input. x, y: (B, 1, H, W)."""
-    x, y = x.float(), y.float()
+    """Per-pixel SSIM map, same size as the input. x, y: (B, 1, H, W).
+
+    Always computed in float32 with autocast disabled: the variance terms are
+    differences of nearly equal numbers (E[x^2] - E[x]^2), which bfloat16
+    (~3 significant digits) gets badly wrong. An earlier version computed the
+    SSIM loss inside the training autocast block, and those runs failed
+    (best validation SSIM 0.18 and 0.05, against 0.75 without the SSIM term).
+    """
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        return _ssim_map_fp32(x.float(), y.float(), data_range)
+
+
+def _ssim_map_fp32(x, y, data_range):
     w = _gaussian_window(x.device, x.dtype)
     pad = SSIM_BORDER
 
