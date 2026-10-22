@@ -3,8 +3,6 @@
 **Author:** Rashim Kaur (s50419139)
 **Project:** COMP3710 Report, Section 2.4 Image Generation, VQ-VAE [Hard Difficulty]
 
-> Work in progress. Sections are filled in as the project develops.
-
 ## 1. Problem and Algorithm Overview
 ### 1.1 The problem
 
@@ -197,12 +195,125 @@ sbatch predict.sh --vqvae outputs/vqvae_e150/best.pt --out results/final
 
 `predict.py` writes all tables to `results/report.md` and figures to `results/`. Model weights, caches and results are not committed (see `.gitignore`); figures used in this README are copied to `images/`.
 
-<!-- TODO: example input/output figures once the final model is chosen. -->
+Example input and output: see Section 6.1 (`images/final_test_examples.png` for reconstructions, `images/final_samples_vqvae.png` for generated slices).
 
 ## 6. Results
+
+All test-set numbers come from `predict.py` on the 540 slices of the 3 held-out test patients. Those patients were never used for training or model selection: every model and setting was chosen on the validation split.
+
 ### 6.1 Baseline (VAE) vs VQ-VAE
+
+**Model selection (ablation, validation SSIM).** Each run adds one change to the previous one:
+
+| Run | Configuration | VQ-VAE val SSIM | Command |
+|---|---|---|---|
+| A | 32×16 code grid, 40 epochs | 0.698 | `sbatch train.sh vqvae` |
+| B | + 150 epochs | 0.747 | `... --epochs 150` |
+| C | + SSIM loss term (weight 0.1) | 0.795 | `... --ssim-weight 0.1` |
+| **D** | **+ 64×32 code grid** (2 downsamplings instead of 3) | **0.933** | `... --n-down 2` |
+
+Run D is the final model. For a fair comparison, the VAE baseline was retrained with **the same three advantages** (150 epochs, SSIM term, 64×32 latent), which raised its validation SSIM from 0.436 to 0.659. Both versions are reported below.
+
+**Test-set reconstruction (mean ± std over 540 slices):**
+
+| Metric | VQ-VAE run A (32×16) | **VQ-VAE final (64×32)** | VAE run A | **VAE matched (64×32)** |
+|---|---|---|---|---|
+| SSIM, whole slice | 0.735 ± 0.035 | **0.944 ± 0.010** | 0.456 ± 0.024 | 0.688 ± 0.026 |
+| PSNR (dB) | 25.06 | **31.09** | 17.03 | 18.31 |
+| MSE | 0.0033 | **0.0008** | 0.0203 | 0.0149 |
+| SSIM in bladder | 0.769 | **0.939** | 0.470 | 0.670 |
+| SSIM in rectum | 0.596 | **0.897** | 0.392 | 0.636 |
+| SSIM in prostate | 0.518 | **0.874** | 0.281 | 0.538 |
+| Slices with SSIM > 0.6 | 100% | **100%** | 0% | 100% |
+| SSIM per patient (40 / 41 / 42) | 0.739 / 0.736 / 0.706 | **0.945 / 0.942 / 0.933** | 0.456 / 0.461 / 0.452 | 0.691 / 0.687 / 0.670 |
+
+Organ SSIM is averaged over slices where the organ covers ≥ 50 pixels (bladder n = 399, rectum n = 212, prostate n = 181).
+
+![Test reconstructions](images/final_test_examples.png)
+*Test slices (top), final VQ-VAE reconstructions (middle) and matched-VAE reconstructions (bottom).*
+
+**Findings.**
+- **The target is exceeded by a wide margin.** The final VQ-VAE reaches a test SSIM of 0.944, and every test slice is above 0.6. It also beats an equally well-trained VAE by +0.26 SSIM and +12.8 dB PSNR, using a similar number of parameters (0.82M vs 0.75M), so the gain comes from the discrete latent rather than from extra capacity or training.
+- **Whole-slice SSIM hides organ-level errors.** In run A the whole-slice SSIM was 0.735, but only 0.518 inside the prostate. One slice scored 0.754 overall and only 0.205 inside the prostate, because the model reproduced the bright bladder and smoothed the prostate's internal texture to flat grey. The 64×32 grid largely closes this gap (prostate 0.874), which is why organ-level metrics are reported alongside whole-slice SSIM.
+
+![Run A prostate failures](images/runA_failures_prostate.png)
+*Run A (32×16 grid): the worst prostate reconstructions. Whole-slice SSIM about 0.75, prostate SSIM as low as 0.205.*
+
+- **Results are consistent across patients** (0.933–0.945), so they are not driven by one easy test patient.
+
+**Generation.** VQ-VAE samples are drawn from the PixelCNN prior, and VAE samples by decoding $z \sim \mathcal{N}(0, I)$. All grids are uncurated (the first 32 of 256 samples).
+
+| | Run A prior (32×16, 15 layers) | **Final prior (64×32, 31 layers)** |
+|---|---|---|
+| Receptive field | 31 of 32 rows | 63 of 64 rows |
+| Best validation NLL (bits per code) | 6.60 | 6.29 |
+
+![Final VQ-VAE samples](images/final_samples_vqvae.png)
+*Final VQ-VAE + PixelCNN samples (T = 1.0, uncurated). Most show a coherent pelvis: a central bladder, symmetric femoral heads and pelvic bones, body outline and subcutaneous fat, with bowel loops in the higher slices.*
+
+![Run A samples](images/runA_samples_vqvae_T1.0.png)
+*Run A samples (32×16 grid) for comparison: realistic local texture but no coherent global anatomy.*
+
+![VAE samples](images/final_samples_vae.png)
+*Matched-VAE samples: texture with no anatomy at all.*
+
+- **The finer code grid transformed sample quality.** Run A samples had MR-like texture, but no whole-pelvis layout. Final samples mostly look like plausible coronal pelvic slices. Each code now covers a 4×4-pixel patch instead of 8×8, and the prior (with a receptive field over the whole grid) learns a lower-entropy distribution (6.29 vs 6.60 bits per code).
+- **The VAE cannot generate at all**, even though its reconstructions are recognisable. This is the "prior hole" problem: the latents the encoder actually uses do not match $\mathcal{N}(0, I)$, so samples land in regions the decoder never learned. The VQ-VAE avoids it by learning its prior separately, on the codes it actually uses.
+- **Interpolation.** Decoding linear blends of the encoder outputs of two test patients changes the image smoothly: the bladder fills in gradually while the bowel loops fade, and the end points and most intermediate frames look anatomically plausible. Around the midpoint, frames partly look like the two anatomies superimposed ("ghosting"), because linear blending of encoder features does not follow the anatomy. The latent space is continuous and organised, but straight lines through it are not guaranteed to stay on realistic anatomy. The VAE interpolates smoothly too, but every frame is blurred.
+
+![Interpolation](images/final_interpolation.png)
+
 ### 6.2 Resource Profiling
+
+Measured on one NVIDIA A100-PCIE-40GB (`predict.py --tasks profile` and training logs):
+
+| Cost | VQ-VAE run A (32×16) | **VQ-VAE final (64×32)** | VAE matched (64×32) |
+|---|---|---|---|
+| Parameters, autoencoder | 886,401 | 821,825 | 751,121 |
+| Parameters, PixelCNN prior | 10,942,592 | 21,704,832 | none |
+| Autoencoder training time | 161 s (40 epochs) | 1,501 s (150 epochs) | 1,267 s (150 epochs) |
+| Autoencoder peak GPU memory, training | 419 MB | 1,348 MB | 628 MB |
+| Prior training time | 618 s | 2,355 s | none |
+| **Prior peak GPU memory, training** | 1,663 MB | **10,944 MB** | none |
+| Reconstruction latency, batch 1 | ~1.7 ms | 1.60 ms | 1.12 ms |
+| Reconstruction throughput, batch 64 | ~9,000–12,000 slices/s | 5,711 slices/s | 8,734 slices/s |
+| **Generation time per slice** | 152 ms | **4,368 ms** | 0.06 ms |
+
+**The dilemma in numbers.** Halving the code-grid spacing improved reconstruction (+0.21 SSIM) and samples (above), but quadrupled the length of the sequence the prior must model. The prior needs 2× the layers to see the whole grid, **28× longer to sample a slice** (4.4 s), and **6.6× more training memory** (10.9 GB). The autoencoder itself stays cheap (1.3 GB, 25 min). Reconstruction is never the bottleneck; generation is. A 1,000-slice synthetic cohort takes about 73 GPU-minutes with the final model, against under 3 minutes with run A, and essentially no time with the VAE, whose samples are, however, unusable.
+
 ### 6.3 Memorisation and Privacy Audit
+
+**Method.** For every slice we compute the RMSE to its nearest training slice (a search over all 11,460). Real slices from the 3 *unseen* test patients define what "genuinely new anatomy" looks like: the threshold τ = 0.1446 is the 5th percentile of their distances, so by construction 5% of real new slices fall below it. A generator that copies training patients places far more than 5% of its samples below τ. Because pixel RMSE can be fooled by simple images, three further checks are reported: SSIM between each sample and its nearest training slice, **code-grid overlap** (the largest fraction of the 2,048 code positions a sample shares with any training slice's grid), and visual inspection of the closest pairs.
+
+| 256 samples per model | Real test → train | VQ-VAE run A | **VQ-VAE final** | VAE matched |
+|---|---|---|---|---|
+| Fraction below τ (memorisation signal) | 5% (by definition) | 11.3% | **2.7%** | 0.0% |
+| Median / min NN RMSE | 0.169 / 0.136 | 0.170 / 0.108 | 0.184 / 0.122 | 0.194 / 0.176 |
+| Median / max SSIM to nearest training slice | 0.271 / 0.399 | 0.293 / 0.441 | 0.253 / 0.415 | 0.129 / 0.160 |
+| Code-grid overlap, median (max) | 7.3% (11.7%)\* | 6.4% (15.4%) | 6.2% (19.8%) | n/a |
+
+\*Reference for the final codebook. With run A's codebook, real test slices give 6.2% (11.5%).
+
+![Memorisation histogram](images/final_memorisation_hist.png)
+![Closest pairs](images/final_memorisation_pairs.png)
+*The 8 final samples closest to the training set (top) and their nearest training slice (bottom).*
+
+**Findings.**
+- **No evidence of memorisation in the final model.** Only 2.7% of samples fall below τ, fewer than the 5% expected for genuinely new patients. Their distance distribution overlaps that of real unseen patients, and the median code-grid overlap (6.2%) is no higher than for real patients (7.3%). The closest pairs share a bladder position and femoral-head layout, but have visibly different anatomy (pair SSIM 0.29–0.42).
+- **Run A's 11.3% was a measurement confound, not copying.** Its closest samples were mostly dark slices with one bright bladder blob. Pixel RMSE is dominated by large dark regions, so such simple images sit "close" to many training slices, even though their nearest neighbours had different anatomy (SSIM 0.30–0.44) and code overlap matched real patients. Pixel distance alone over-reports memorisation for low-detail samples.
+- **Sampling temperature trades plausibility for privacy.** Sampling run A's prior at lower temperatures makes it pick more confident codes:
+
+| Run A prior | T = 1.0 | T = 0.85 | T = 0.70 |
+|---|---|---|---|
+| Fraction below τ | 11.3% | 23.0% | 24.6% |
+| Median code-grid overlap | 6.4% | 7.0% | 8.2% |
+| Median SSIM to nearest training / test slice | 0.293 / 0.245 | 0.316 / 0.268 | 0.331 / 0.271 |
+
+Lowering T makes samples smoother and more "typical" (higher SSIM to real slices), but more than **doubles** the fraction that sits suspiciously close to training slices, and steadily increases code reuse. Visually, T = 0.7 samples are blob-like and less detailed (below). **Temperature is a privacy control, not just a quality knob:** release samples at T = 1.0.
+
+![Run A samples at T=0.7](images/runA_samples_vqvae_T0.70.png)
+
+- **Plausibility metric: a lesson.** The midpoint review proposed "median SSIM of each sample to its nearest real slice > 0.6" (AC2). This proved unreachable even for real data: real unseen slices reach only 0.271 against their nearest training slice, because anatomy, positioning and slice depth differ between patients. AC2 was therefore revised to compare against that real-data reference. Even so, nearest-neighbour SSIM disagrees with visual quality. The final model's samples look **far more** anatomically plausible than run A's, yet score lower (0.253 vs 0.293), because realistic fine texture that does not align pixel-for-pixel is penalised more than smooth, generic texture. Nearest-neighbour SSIM is not a reliable plausibility measure, so visual inspection was used as the primary evidence. (A learned-feature metric such as FID was not used: it needs a pretrained network that could not be downloaded on the cluster, and ImageNet features are themselves a questionable fit for MR.)
 ### 6.4 Failure Case Autopsy
 
 #### 6.4.1 Failures found and fixed during development
@@ -214,7 +325,39 @@ Three failures were caught by self-tests and CPU smoke runs before they could af
 | F1 | **Codebook collapse.** The untrained model mapped every position to one code (perplexity 1.0 of 512). After adding data-dependent initialisation, a smoke run still collapsed from perplexity 76 to 1.0 within 10 steps. | Early in training the encoder outputs move faster than the codebook can follow, so every output ends up nearest the same code. The first dead-code rule only restarted a code once its EMA usage fell below 1, which took about 400 steps. | Initialise the codebook from real encoder outputs, and restart any code unused for 50 consecutive steps at a random current encoder output. | Smoke run: perplexity 1.0 → 156 at the first restart, then 100–200. Full run: 376/512 codes in use. A self-test forces a collapse and checks recovery. |
 | F2 | **Incoherent samples.** The first PixelCNN produced realistic local texture but no coherent pelvis (scattered bones, one-sided black regions). | Receptive field: 12 gated layers with 3×3 kernels let each position see only 14 of the 32 code rows above it, so the lower half of a slice was generated without seeing the upper half. | 15 layers with 5×5 kernels (receptive field of 31 rows, i.e. the whole grid), plus dropout 0.1 against the overfitting seen in v1 (validation NLL minimum at epoch ~15, then rising). | Best validation NLL 4.588 → 4.577 nats/code. Visual comparison in Section 6.3. |
 | F3 | **SSIM-loss runs failed.** Adding 0.1·(1 − SSIM) to the loss gave best validation SSIM 0.178 and 0.054, against 0.747 without it. Loss and validation SSIM were flat from epoch 1 (0.19 and 0.162). | SSIM was computed inside the bfloat16 autocast region. Its variance terms are differences of nearly equal numbers (E[x²] − E[x]²), which bfloat16 (~3 significant digits) gets badly wrong, so the SSIM gradient was meaningless and stopped the model learning. | Compute SSIM in float32 with autocast disabled. Training now also stops immediately on a non-finite loss. | Re-running the same settings: best validation SSIM 0.178 → **0.795** (32×16 grid) and 0.054 → **0.933** (64×32 grid). |
+#### 6.4.2 Test-set failure cases (final VQ-VAE)
+
+![Worst slices](images/final_failures_whole.png)
+![Worst prostate slices](images/final_failures_prostate.png)
+![SSIM vs slice](images/final_ssim_vs_slice.png)
+
+1. **Fine, high-contrast speckled texture (patient 42, week 0, slices 32–39).** All five worst whole-slice reconstructions (SSIM 0.921–0.923) are consecutive slices from one scan session, with mottled bowel loops in the upper pelvis and small bright speckles around and just above the prostate. In the final model the error maps concentrate on that speckled region, which is reconstructed as smoother, lower-contrast texture, while the rest of the slice has little error. Each code represents a 4×4-pixel patch drawn from a 512-entry codebook, and this high-frequency, patient-specific texture is rare in training data, so it is approximated by smoother codes. The same slices were the worst in run A, where they dropped to SSIM 0.65 and the error was spread over the whole slice.
+2. **Prostate detail.** The worst prostate reconstructions (prostate SSIM 0.786–0.824) are either small (97–198 pixels), where a few misplaced pixels dominate the score, or large with heterogeneous internal texture (691 pixels, patient 42), where fine internal structure is smoothed. Run A failed badly on the same kind of slice (prostate SSIM as low as 0.205); the final model keeps the prostate outline and most of its internal texture.
+3. **Slice position.** Whole-slice SSIM falls steadily with slice index (from about 0.96 to about 0.93; in run A from about 0.80 to about 0.70), as slices further through the volume contain more bowel and fine structure. Patient 42 dips to about 0.92 at slices 32–40, the speckled slices above. Inside the prostate, SSIM drifts down slightly as the gland gets larger (more internal texture to reproduce), with patient 41 consistently lowest.
+4. **Sample artefacts.** A few generated slices have a thin bright vertical line along the right image edge, or asymmetric pelvic bones (visible in the sample grid). They do not appear in reconstructions, so they come from the prior, not the decoder. A likely cause is single unlikely codes sampled at the right-hand border, where a raster-order PixelCNN has the least context about what lies beyond the edge.
+5. **Overfitting of the prior.** With only 31 training patients, PixelCNN validation NLL reached its minimum early and then rose, even with dropout. The best-validation checkpoint is used, but more patients (or conditioning on slice position) would be the most direct fix for both coherence and memorisation risk.
+
 ### 6.5 Recommendation to Project Manager
+
+**Question: is the generated cohort safe, non-memorised and clinically plausible enough for downstream training?**
+
+| Acceptance criterion | Final result | Verdict |
+|---|---|---|
+| AC1 Fidelity | Test SSIM 0.944 (prostate 0.874) vs matched VAE 0.688 | ✅ Met |
+| AC2 Plausibility | Visually coherent pelvic anatomy in most samples; nearest-neighbour SSIM 0.253 vs real reference 0.271 (a weak metric, see 6.3) | ⚠️ Largely met visually, not by the metric |
+| AC3 No memorisation | 2.7% below τ (real patients: 5%); code overlap at real-patient level; no visual copies | ✅ Met |
+| AC4 Diversity | Uncurated samples vary in slice depth, bladder size and anatomy; no mode collapse <!-- TODO: add final codebook perplexity from outputs/vqvae_d2_e150_ssim/history.json --> | ✅ Met |
+| AC5 Resources | Autoencoder 1.3 GB / 25 min ✅; prior 10.9 GB (> 8 GB) and 4.4 s per slice (> 1 s) | ❌ Generation exceeds budget |
+
+**Recommendation: approve the final VQ-VAE for a limited internal pilot, not for external release.**
+
+1. **Privacy: acceptable, with a release gate.** Nothing in the audit suggests that patients are being reproduced. Because the audit is empirical (3 test patients, pixel and code distances) and not a formal guarantee, every released batch should be screened automatically: discard any sample below τ, and keep sampling at T = 1.0, since lower temperatures more than doubled near-copies.
+2. **Plausibility: promising, not yet clinical.** Most samples show coherent pelvic anatomy, but some have artefacts, and no clinician has reviewed them. A radiation oncologist should rate a random subset before the cohort is used for anything beyond research prototyping.
+3. **It cannot yet serve the stated purpose.** Collaborators want to train *segmentation* models, which need masks. The current generator produces unlabelled images. The next step is to generate image–mask pairs (e.g. a VQ-VAE over image + label channels, or a prior conditioned on slice position and organ masks), which would also be expected to improve coherence.
+4. **Cost.** The 64×32 configuration is the right choice for quality, but generation takes about 4.4 s per slice and the prior needs about 11 GB to train. That is fine for a one-off cohort of a few thousand slices (a few GPU-hours), but not for on-demand generation. If cost matters more than fidelity, the 32×16 model is 28× faster, at the price of visibly worse anatomy.
+5. **Do not use the VAE baseline for generation.** Its reconstructions are acceptable, but its samples contain no anatomy.
+
+In short: **the VQ-VAE solves the fidelity problem and shows no sign of memorising patients, but its synthetic cohort is not yet a drop-in replacement for real labelled data.**
 
 ## 7. Artificial Intelligence Usage Disclosure
 > **DRAFT. Rashim: edit this so that every statement is accurate before submission.** Add any other tools you used (e.g. GitHub Copilot or ChatGPT), and describe in your own words which parts you wrote or changed yourself.
