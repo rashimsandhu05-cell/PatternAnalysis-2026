@@ -214,6 +214,17 @@ All test-set numbers come from `predict.py` on the 540 slices of the 3 held-out 
 
 Run D is the final model. For a fair comparison, the VAE baseline was retrained with **the same three advantages** (150 epochs, SSIM term, 64×32 latent), which raised its validation SSIM from 0.436 to 0.659. Both versions are reported below.
 
+**Training curves (final configuration, 64×32 grid).** Validation metrics are computed every epoch on the 4 validation patients. The checkpoint with the best validation score is kept (`best.pt`).
+
+![VQ-VAE curves](images/curves_vqvae_final.png)
+*VQ-VAE: training loss falls within a few epochs. Validation SSIM rises to about 0.93 by roughly epoch 50 and then plateaus, with no sign of overfitting. Codebook perplexity peaks near 400 early and settles at about 375 of 512, so no collapse occurs at any point.*
+
+![VAE curves](images/curves_vae_final.png)
+*VAE: the early rise in training loss is the KL warm-up (its weight ramps from 0 to 1 over 5 epochs). Validation SSIM peaks at 0.659 around epoch 20 and then drifts down to about 0.61 while PSNR stays flat: the KL term keeps pulling the latent toward $\mathcal{N}(0, I)$ at the cost of structural detail. Best-checkpoint selection keeps the peak.*
+
+![PixelCNN curves](images/curves_pixelcnn_final.png)
+*PixelCNN prior: training NLL keeps falling, but validation NLL reaches its minimum around epoch 12 and then rises, even with dropout 0.1. The prior starts to fit training-set code patterns that do not generalise, which is the early sign of memorisation. The best-validation checkpoint (epoch ~12) is used for all sampling, and the audit in Section 6.3 checks that no copying reached the samples.*
+
 **Test-set reconstruction (mean ± std over 540 slices):**
 
 | Metric | VQ-VAE run A (32×16) | **VQ-VAE final (64×32)** | VAE run A | **VAE matched (64×32)** |
