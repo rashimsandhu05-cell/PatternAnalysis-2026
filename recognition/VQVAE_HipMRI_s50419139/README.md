@@ -382,22 +382,29 @@ Three failures were caught by self-tests and CPU smoke runs before they could af
 In short: **the VQ-VAE solves the fidelity problem and shows no sign of memorising patients, but its synthetic cohort is not yet a drop-in replacement for real labelled data.**
 
 ## 7. Artificial Intelligence Usage Disclosure
-> **DRAFT. Rashim: edit this so that every statement is accurate before submission.** Add any other tools you used (e.g. GitHub Copilot or ChatGPT), and describe in your own words which parts you wrote or changed yourself.
 
-**Tools used.** Claude (Anthropic), used through the Claude app as a coding and writing assistant throughout the project.
+**Tool used.** Claude (Anthropic), used through the Claude app throughout the project. No other AI tools were used: no GitHub Copilot, ChatGPT or Codex, and no AI auto-complete in the editor.
 
-**What it was used for.**
-- Interpreting the assessment specification and planning the project (model choice, baseline, investigation design).
-- Drafting the code in all project files (`data_audit.py`, `dataset.py`, `modules.py`, `train.py`, `predict.py`, `utils.py`, Slurm scripts).
-- Debugging: diagnosing codebook collapse, the bfloat16 SSIM-loss failure, the Slurm partition/account error, and git/VPN set-up problems.
-- Drafting README text, including the feasibility review.
+**What Claude was used for.**
+- **Planning:** interpreting the assessment specification, choosing the project (VQ-VAE, Hard difficulty) and baseline, and designing the investigation (ablation, memorisation audit, failure analysis).
+- **Code:** drafting all project code (`data_audit.py`, `dataset.py`, `modules.py`, `train.py`, `predict.py`, `utils.py`, `train.sh`, `predict.sh`, `environment.yml`).
+- **Debugging:** diagnosing problems from the logs and figures I sent back. This included codebook collapse, the PixelCNN receptive field, the SSIM loss failing under bfloat16 autocast, the VAE checkpoint being selected during KL warm-up, and set-up problems (UQ VPN, Rangpur access, Slurm partition/account, git and scp).
+- **Writing:** drafting this README, including the feasibility review, and interpreting the results.
 
-**How outputs were verified.**
-- Every model file has executable self-tests that were run on Rangpur: output shapes, PixelCNN causality (perturbing one code must not change any earlier prediction), recovery from a forced codebook collapse, and SSIM agreement with `skimage.metrics.structural_similarity` (difference < 1e-4).
-- Every training path was run as a CPU smoke test before any GPU job. This caught two real bugs (codebook collapse within 10 steps, and the SSIM loss failing under bfloat16 autocast), and both fixes were confirmed by re-running.
-- The data audit and label overlays were checked visually against the anatomy (bladder, rectum, prostate and bones in the expected positions).
-- All reported numbers come from logged runs (`history.json`, `summary.json`, `results/report.md`), not from the assistant. Model selection used the validation split only, and the test split was used once for the final evaluation.
-- I read and ran all of the code, and can explain each component (quantiser, straight-through estimator, EMA updates, gated masked convolutions, the memorisation criterion).
+**What I did.**
+- Set up and ran everything myself: the fork and branch, VPN, Rangpur conda environment, and every data audit, self-test, smoke test, training job and evaluation job on the cluster (about 20 Slurm batch jobs plus interactive sessions).
+- Inspected every output (logs, training curves, reconstructions, sample grids, memorisation pairs, failure figures) and reported what I saw. Several fixes started from problems visible in these outputs: the collapsed perplexity curve, grey smoke-test reconstructions, incoherent samples, flat SSIM-loss runs, and the "epoch 2" VAE checkpoint in a log.
+- Made the project decisions: aiming for the highest marks with a Hard model, running the ablation to raise SSIM, retraining the VAE with the same settings so the comparison is fair, and following up my tutor's feedback at the midpoint check-off by adding the generalisation (overfitting) check.
+- Reviewed all code and README text before committing it, and committed each change myself in small, described steps.
+
+**How the AI-generated work was verified.**
+- **Self-tests run on Rangpur:** output shapes; PixelCNN causality (changing one code must not change any earlier prediction), for both kernel sizes; recovery from a forced codebook collapse; and SSIM agreement with `skimage.metrics.structural_similarity` (difference < 1e-4).
+- **CPU smoke tests before any GPU job.** These caught real bugs (codebook collapse within 10 steps, and the SSIM-loss failure), and each fix was confirmed by re-running.
+- **Visual checks:** the data audit and label overlays were checked against the anatomy (bladder, rectum, prostate and bones in the expected positions), and every reported figure was inspected.
+- **Numbers come from logged runs** (`history.json`, `summary.json`, `results/*/report.md`), never from the assistant. Models were selected on the validation split only, and the test split was used for final evaluation.
+- **Sanity checks against expectations:** for example, the train/validation/test SSIM comparison to rule out overfitting, and the real-patient reference distances in the memorisation audit.
+
+I take full responsibility for every line of code, every formula and every reported result in this submission, and I can explain each component (data pipeline, vector quantiser and straight-through estimator, EMA codebook updates, gated masked convolutions, the evaluation metrics and the memorisation criterion).
 
 ## 8. References
 
