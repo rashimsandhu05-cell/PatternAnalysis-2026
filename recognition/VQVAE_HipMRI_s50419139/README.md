@@ -220,10 +220,19 @@ Run D is the final model. For a fair comparison, the VAE baseline was retrained 
 *VQ-VAE: training loss falls within a few epochs. Validation SSIM rises to about 0.93 by roughly epoch 50 and then plateaus, with no sign of overfitting. Codebook perplexity peaks near 400 early and settles at about 375 of 512, so no collapse occurs at any point.*
 
 ![VAE curves](images/curves_vae_final.png)
-*VAE: the early rise in training loss is the KL warm-up (its weight ramps from 0 to 1 over 5 epochs). Validation SSIM peaks at 0.659 around epoch 20 and then drifts down to about 0.61 while PSNR stays flat: the KL term keeps pulling the latent toward $\mathcal{N}(0, I)$ at the cost of structural detail. Best-checkpoint selection keeps the peak.*
+*VAE: the early rise in training loss is the KL warm-up (its weight ramps from 0 to 1 over 5 epochs). Validation SSIM is highest at epoch 2 (0.659), while the KL weight is still only about 0.4. It then drops as the KL term takes full effect, recovers to about 0.645 around epoch 20, and drifts down to about 0.61, while PSNR stays flat: the KL term keeps pulling the latent toward $\mathcal{N}(0, I)$ at the cost of structural detail. **Caveat:** best-checkpoint selection therefore picked the epoch-2 model, which is barely regularised (the same happened in run A). This flatters the VAE's reconstructions and is not a fully trained VAE. `train.py` now only selects VAE checkpoints after the warm-up, and the fully trained epoch-150 VAE is also reported below.*
 
 ![PixelCNN curves](images/curves_pixelcnn_final.png)
 *PixelCNN prior: training NLL keeps falling, but validation NLL reaches its minimum around epoch 12 and then rises, even with dropout 0.1. The prior starts to fit training-set code patterns that do not generalise, which is the early sign of memorisation. The best-validation checkpoint (epoch ~12) is used for all sampling, and the audit in Section 6.3 checks that no copying reached the samples.*
+
+**Overfitting check (generalisation).** The same models reconstruct every slice of all three splits (`predict.py --tasks generalisation`):
+
+| Model | Train SSIM (11,460 slices, 31 patients) | Validate SSIM (660, 4) | Test SSIM (540, 3) | Train − test gap | Train / test PSNR (dB) |
+|---|---|---|---|---|---|
+| VQ-VAE final | 0.937 | 0.934 | **0.944** | −0.007 | 30.32 / 31.09 |
+| VAE matched (epoch-2 checkpoint) | 0.671 | 0.659 | 0.688 | −0.017 | 18.09 / 18.31 |
+
+**The VQ-VAE does not overfit:** it reconstructs patients it has never seen as well as its training patients. Test is marginally higher than train, most likely because the 3 test patients are slightly easier on average (with only 3 patients, a difference of 0.007 is within patient-to-patient variation, which spans 0.933–0.945). A memorising autoencoder would show train SSIM well above test. This also rules out the concern that the high SSIM comes from fitting the 31 training patients. Overfitting does appear in the **PixelCNN prior** (rising validation NLL after about epoch 12, see the curves above), and is controlled there by best-checkpoint selection and audited in Section 6.3.
 
 **Test-set reconstruction (mean ± std over 540 slices):**
 
