@@ -25,6 +25,9 @@ Tasks (all write to --out, default results/):
                 -> memorisation_hist.png, memorisation_pairs.png, memorisation.json
   interpolate   Latent interpolation between slices of two different test patients.
                 -> interpolation.png
+  generalisation  Overfitting check: reconstruction SSIM/PSNR on the train, validate
+                and test splits side by side. A small train-test gap means the
+                autoencoder generalises to unseen patients. -> generalisation.json
   profile       Parameters, inference latency/throughput, generation time and peak
                 GPU memory, plus training cost from outputs/*/summary.json.
                 -> profile.json
@@ -56,7 +59,7 @@ from train import load_checkpoint
 from utils import (_plt, _show, get_device, masked_ssim, peak_memory_mb, psnr, reset_peak_memory, save_image_grid,
                    save_json, seed_everything, ssim)
 
-ALL_TASKS = ["evaluate", "failures", "generate", "memorisation", "interpolate", "profile"]
+ALL_TASKS = ["evaluate", "failures", "generate", "memorisation", "interpolate", "profile", "generalisation"]
 ORGANS = {3: "bladder", 4: "rectum", 5: "prostate"}
 ORGAN_COLOURS = {3: "gold", 4: "magenta", 5: "red"}
 MIN_ORGAN_PIXELS = 50  # ignore slices where an organ is only a few pixels (unstable SSIM)
@@ -534,6 +537,43 @@ def task_interpolate(models, test, device, out, steps=8):
 
 
 # --------------------------------------------------------------------------- #
+# Task: generalisation (overfitting check)
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def split_metrics(model, images, device, bs=256):
+    """Mean SSIM and PSNR of reconstructions over a whole split, computed on the device in batches."""
+    ssims, psnrs = [], []
+    for i in range(0, len(images), bs):
+        x = images[i:i + bs].to(device).float()
+        recon = model(x)[0].float().clamp(0, 1)
+        ssims.append(ssim(recon, x).cpu())
+        psnrs.append(psnr(recon, x).cpu())
+    s, p = torch.cat(ssims), torch.cat(psnrs)
+    return {"ssim_mean": s.mean().item(), "ssim_std": s.std().item(), "psnr_mean": p.mean().item(), "n": len(s)}
+
+
+def task_generalisation(models, args, device, out, report):
+    splits = {}
+    for split in ("train", "validate", "test"):
+        ds = HipMRISlices(split, args.root, args.cache_dir)
+        splits[split] = (ds.images, len(set(ds.case_ids.tolist())))
+    result = {name: {split: split_metrics(model, imgs, device) for split, (imgs, _) in splits.items()}
+              for name, model in models.items()}
+    save_json(result, out / "generalisation.json")
+
+    lines = ["| Model | Train SSIM | Validate SSIM | Test SSIM | Train − test gap | Train PSNR | Test PSNR |",
+             "|---|---|---|---|---|---|---|"]
+    for name, r in result.items():
+        gap = r["train"]["ssim_mean"] - r["test"]["ssim_mean"]
+        lines.append(f"| {name} | {r['train']['ssim_mean']:.3f} | {r['validate']['ssim_mean']:.3f} | "
+                     f"{r['test']['ssim_mean']:.3f} | {gap:+.3f} | {r['train']['psnr_mean']:.2f} | "
+                     f"{r['test']['psnr_mean']:.2f} |")
+    counts = ", ".join(f"{k}: {len(v[0])} slices / {v[1]} patients" for k, v in splits.items())
+    report.add("Generalisation (overfitting check)", "\n".join(lines) + f"\n\nSplits: {counts}.")
+    print("\n".join(lines))
+
+
+# --------------------------------------------------------------------------- #
 # Task: profile
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -660,6 +700,8 @@ def main():
         task_interpolate(models, test, device, out)
     if "profile" in args.tasks:
         task_profile(models, prior, args, test, device, out, report)
+    if "generalisation" in args.tasks:
+        task_generalisation(models, args, device, out, report)
     print(f"Done. Results in {out}/ (summary: {out / 'report.md'})")
 
 
