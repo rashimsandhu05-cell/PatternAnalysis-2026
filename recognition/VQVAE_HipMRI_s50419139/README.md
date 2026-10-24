@@ -346,7 +346,7 @@ Three failures were caught by self-tests and CPU smoke runs before they could af
 | AC1 Fidelity | Test SSIM 0.944 (prostate 0.874) vs matched VAE 0.688 | ✅ Met |
 | AC2 Plausibility | Visually coherent pelvic anatomy in most samples; nearest-neighbour SSIM 0.253 vs real reference 0.271 (a weak metric, see 6.3) | ⚠️ Largely met visually, not by the metric |
 | AC3 No memorisation | 2.7% below τ (real patients: 5%); code overlap at real-patient level; no visual copies | ✅ Met |
-| AC4 Diversity | Uncurated samples vary in slice depth, bladder size and anatomy; no mode collapse <!-- TODO: add final codebook perplexity from outputs/vqvae_d2_e150_ssim/history.json --> | ✅ Met |
+| AC4 Diversity | Codebook perplexity 374 of 512 at the end of training (target > 256); uncurated samples vary in slice depth, bladder size and anatomy, with no mode collapse | ✅ Met |
 | AC5 Resources | Autoencoder 1.3 GB / 25 min ✅; prior 10.9 GB (> 8 GB) and 4.4 s per slice (> 1 s) | ❌ Generation exceeds budget |
 
 **Recommendation: approve the final VQ-VAE for a limited internal pilot, not for external release.**
