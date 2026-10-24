@@ -231,21 +231,22 @@ Run D is the final model. For a fair comparison, the VAE baseline was retrained 
 |---|---|---|---|---|---|
 | VQ-VAE final | 0.937 | 0.934 | **0.944** | −0.007 | 30.32 / 31.09 |
 | VAE matched (epoch-2 checkpoint) | 0.671 | 0.659 | 0.688 | −0.017 | 18.09 / 18.31 |
+| VAE matched, fully trained (epoch 150) | 0.620 | 0.609 | 0.655 | −0.035 | 22.27 / 22.92 |
 
 **The VQ-VAE does not overfit:** it reconstructs patients it has never seen as well as its training patients. Test is marginally higher than train, most likely because the 3 test patients are slightly easier on average (with only 3 patients, a difference of 0.007 is within patient-to-patient variation, which spans 0.933–0.945). A memorising autoencoder would show train SSIM well above test. This also rules out the concern that the high SSIM comes from fitting the 31 training patients. Overfitting does appear in the **PixelCNN prior** (rising validation NLL after about epoch 12, see the curves above), and is controlled there by best-checkpoint selection and audited in Section 6.3.
 
 **Test-set reconstruction (mean ± std over 540 slices):**
 
-| Metric | VQ-VAE run A (32×16) | **VQ-VAE final (64×32)** | VAE run A | **VAE matched (64×32)** |
-|---|---|---|---|---|
-| SSIM, whole slice | 0.735 ± 0.035 | **0.944 ± 0.010** | 0.456 ± 0.024 | 0.688 ± 0.026 |
-| PSNR (dB) | 25.06 | **31.09** | 17.03 | 18.31 |
-| MSE | 0.0033 | **0.0008** | 0.0203 | 0.0149 |
-| SSIM in bladder | 0.769 | **0.939** | 0.470 | 0.670 |
-| SSIM in rectum | 0.596 | **0.897** | 0.392 | 0.636 |
-| SSIM in prostate | 0.518 | **0.874** | 0.281 | 0.538 |
-| Slices with SSIM > 0.6 | 100% | **100%** | 0% | 100% |
-| SSIM per patient (40 / 41 / 42) | 0.739 / 0.736 / 0.706 | **0.945 / 0.942 / 0.933** | 0.456 / 0.461 / 0.452 | 0.691 / 0.687 / 0.670 |
+| Metric | VQ-VAE run A (32×16) | **VQ-VAE final (64×32)** | VAE run A | VAE matched, epoch 2 | **VAE matched, fully trained (epoch 150)** |
+|---|---|---|---|---|---|
+| SSIM, whole slice | 0.735 ± 0.035 | **0.944 ± 0.010** | 0.456 ± 0.024 | 0.688 ± 0.026 | 0.655 ± 0.028 |
+| PSNR (dB) | 25.06 | **31.09** | 17.03 | 18.31 | 22.92 |
+| MSE | 0.0033 | **0.0008** | 0.0203 | 0.0149 | 0.0053 |
+| SSIM in bladder | 0.769 | **0.939** | 0.470 | 0.670 | 0.787 |
+| SSIM in rectum | 0.596 | **0.897** | 0.392 | 0.636 | 0.504 |
+| SSIM in prostate | 0.518 | **0.874** | 0.281 | 0.538 | 0.460 |
+| Slices with SSIM > 0.6 | 100% | **100%** | 0% | 100% | 94.1% |
+| SSIM per patient (40 / 41 / 42) | 0.739 / 0.736 / 0.706 | **0.945 / 0.942 / 0.933** | 0.456 / 0.461 / 0.452 | 0.691 / 0.687 / 0.670 | 0.663 / 0.644 / 0.611 |
 
 Organ SSIM is averaged over slices where the organ covers ≥ 50 pixels (bladder n = 399, rectum n = 212, prostate n = 181).
 
@@ -253,7 +254,8 @@ Organ SSIM is averaged over slices where the organ covers ≥ 50 pixels (bladder
 *Test slices (top), final VQ-VAE reconstructions (middle) and matched-VAE reconstructions (bottom).*
 
 **Findings.**
-- **The target is exceeded by a wide margin.** The final VQ-VAE reaches a test SSIM of 0.944, and every test slice is above 0.6. It also beats an equally well-trained VAE by +0.26 SSIM and +12.8 dB PSNR, using a similar number of parameters (0.82M vs 0.75M), so the gain comes from the discrete latent rather than from extra capacity or training.
+- **The target is exceeded by a wide margin.** The final VQ-VAE reaches a test SSIM of 0.944, and every test slice is above 0.6. It beats the matched VAE, trained with the same three advantages and a similar number of parameters (0.82M vs 0.75M), whichever VAE checkpoint is used: by +0.26 SSIM / +12.8 dB against the epoch-2 checkpoint, and by +0.29 SSIM / +8.2 dB against the fully trained epoch-150 VAE. The gain therefore comes from the discrete latent, not from extra capacity, training or checkpoint choice.
+- **The two VAE checkpoints show the VAE's trade-off.** The fully trained VAE has better intensities (PSNR 22.9 vs 18.3 dB, bladder SSIM 0.787 vs 0.670), but worse structure (whole-slice SSIM 0.655 vs 0.688, prostate 0.460 vs 0.538, and 5.9% of slices below 0.6). Once the KL term is fully weighted, fine edges are blurred away in exchange for a latent closer to $\mathcal{N}(0, I)$. The VQ-VAE has no such trade-off, because its latent does not have to match a fixed prior.
 - **Whole-slice SSIM hides organ-level errors.** In run A the whole-slice SSIM was 0.735, but only 0.518 inside the prostate. One slice scored 0.754 overall and only 0.205 inside the prostate, because the model reproduced the bright bladder and smoothed the prostate's internal texture to flat grey. The 64×32 grid largely closes this gap (prostate 0.874), which is why organ-level metrics are reported alongside whole-slice SSIM.
 
 ![Run A prostate failures](images/runA_failures_prostate.png)
@@ -275,7 +277,7 @@ Organ SSIM is averaged over slices where the organ covers ≥ 50 pixels (bladder
 *Run A samples (32×16 grid) for comparison: realistic local texture but no coherent global anatomy.*
 
 ![VAE samples](images/final_samples_vae.png)
-*Matched-VAE samples: texture with no anatomy at all.*
+*Matched-VAE samples (epoch-2 checkpoint): texture with no anatomy at all. Samples from the fully trained epoch-150 VAE are somewhat closer to real slices (median SSIM to nearest training slice 0.164 vs 0.129), but still well below the real-patient reference of 0.271, so the conclusion is the same.*
 
 - **The finer code grid transformed sample quality.** Run A samples had MR-like texture, but no whole-pelvis layout. Final samples mostly look like plausible coronal pelvic slices. Each code now covers a 4×4-pixel patch instead of 8×8, and the prior (with a receptive field over the whole grid) learns a lower-entropy distribution (6.29 vs 6.60 bits per code).
 - **The VAE cannot generate at all**, even though its reconstructions are recognisable. This is the "prior hole" problem: the latents the encoder actually uses do not match $\mathcal{N}(0, I)$, so samples land in regions the decoder never learned. The VQ-VAE avoids it by learning its prior separately, on the codes it actually uses.
