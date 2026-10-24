@@ -237,7 +237,11 @@ def train_autoencoder(args, device, out):
         history.append(record)
 
         save_checkpoint(out / "last.pt", model, args.model, model_kwargs, epoch, record["val_ssim"], args, history)
-        if record["val_ssim"] > best:
+        # A VAE only counts as "best" once its KL warm-up has finished. Earlier
+        # epochs are barely regularised autoencoders (KL weight < 1), and in the
+        # first runs the selected "best" VAE came from epoch 2 for that reason.
+        eligible = args.model != "vae" or epoch > math.ceil(args.kl_warmup_epochs)
+        if eligible and record["val_ssim"] > best:
             best = record["val_ssim"]
             save_checkpoint(out / "best.pt", model, args.model, model_kwargs, epoch, best, args, history)
 
