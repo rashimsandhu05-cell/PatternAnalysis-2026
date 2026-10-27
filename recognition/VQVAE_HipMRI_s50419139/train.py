@@ -18,8 +18,11 @@ Each run writes to outputs/<model>/ (git-ignored):
     samples.png            generated slices (pixelcnn: from sampled code grids)
     codes.pt               (pixelcnn) train/validate code grids from the VQ-VAE
 
-The test split is never touched here; it is reserved for the final evaluation
-in predict.py so that model selection cannot leak into the reported results.
+Model selection uses the validation split only. The test split is used exactly
+once, after training: the best checkpoint is reloaded and its test-set SSIM,
+PSNR and MSE are printed and saved to summary.json (test_* keys). It never
+influences which checkpoint is kept. The full test-set analysis (organ-level
+SSIM, failure cases, memorisation audit, profiling) is in predict.py.
 
 Losses
 ------
@@ -55,6 +58,7 @@ SMOKE_TRAIN_BATCHES, SMOKE_VAL_BATCHES = 5, 2
 
 
 def parse_args():
+    """Command-line options for all three models; fills in defaults that depend on --model and --smoke."""
     p = argparse.ArgumentParser(description="Train VQ-VAE, VAE baseline or PixelCNN prior on HipMRI 2D.")
     p.add_argument("--model", choices=["vqvae", "vae", "pixelcnn"], required=True)
     p.add_argument("--epochs", type=int, default=None, help="default: 40 (vqvae, vae), 60 (pixelcnn)")
@@ -118,6 +122,7 @@ def limited(loader, max_batches):
 
 
 def save_checkpoint(path, model, model_type, model_kwargs, epoch, metric, args, history):
+    """Save weights together with everything needed to rebuild and audit the model (type, constructor arguments, epoch, metric, run arguments, history)."""
     torch.save({
         "model": model.state_dict(),
         "model_type": model_type,
@@ -163,6 +168,11 @@ def evaluate_reconstruction(model, loader, device, amp, max_batches=None):
 
 
 def train_autoencoder(args, device, out):
+    """Train the VQ-VAE or the VAE baseline, validating every epoch.
+
+    Writes last.pt / best.pt (best validation SSIM), history.json, curves.png,
+    a reconstruction figure, and summary.json with training time and peak GPU memory.
+    """
     loaders = get_dataloaders(args.root, args.cache_dir, args.batch_size, args.num_workers)
     arch = {"hidden": args.hidden, "n_down": args.n_down}
     if args.model == "vqvae":
@@ -267,7 +277,23 @@ def train_autoencoder(args, device, out):
             samples = model.sample(args.n_samples, IMG_H, IMG_W, device).float().cpu()
         save_image_grid(samples, out / "samples.png", title="VAE samples, z ~ N(0, I)")
 
-    summary = {"model": args.model, "params": count_parameters(model), "best_val_ssim": best,
+    if not (out / "best.pt").exists():
+        # Only possible when training is shorter than the VAE's KL warm-up
+        # (e.g. --smoke): fall back to the final epoch so later steps still work.
+        print(f"[{args.model}] no epoch was eligible for best.pt (training shorter than KL warm-up); "
+              f"using the last epoch", flush=True)
+        best = history[-1]["val_ssim"]
+        save_checkpoint(out / "best.pt", model, args.model, model_kwargs, args.epochs, best, args, history)
+
+    # Testing: evaluate the selected (best-validation) checkpoint once on the
+    # held-out test patients. This happens after selection, so it cannot leak.
+    best_model, _ = load_checkpoint(out / "best.pt", device)
+    test_metrics = evaluate_reconstruction(best_model, loaders["test"], device, amp, max_val)
+    test_metrics = {k.replace("val_", "test_"): v for k, v in test_metrics.items()}
+    print(f"[{args.model}] test (best checkpoint): ssim={test_metrics['test_ssim']:.4f} "
+          f"psnr={test_metrics['test_psnr']:.2f}dB mse={test_metrics['test_mse']:.5f}", flush=True)
+
+    summary = {"model": args.model, "params": count_parameters(model), "best_val_ssim": best, **test_metrics,
                "model_kwargs": model_kwargs, "epochs": args.epochs, "ssim_weight": args.ssim_weight,
                "total_train_time_s": time.time() - train_start,
                "peak_gpu_mem_mb": max(h["peak_gpu_mem_mb"] for h in history)}
@@ -295,6 +321,7 @@ def encode_split(vqvae, split, args, device, max_images=None):
 
 @torch.no_grad()
 def pixelcnn_loss(prior, loader, device, amp, max_batches=None):
+    """Mean negative log-likelihood (nats per code) of the prior over a loader of code grids."""
     prior.eval()
     total, n = 0.0, 0
     for (codes,) in limited(loader, max_batches):
@@ -307,6 +334,11 @@ def pixelcnn_loss(prior, loader, device, amp, max_batches=None):
 
 
 def train_pixelcnn(args, device, out):
+    """Train the Gated PixelCNN prior on code grids from a trained VQ-VAE.
+
+    Encodes the train/validate splits once, trains with cross-entropy, keeps the
+    checkpoint with the lowest validation NLL, then samples new slices with it.
+    """
     vqvae, vq_ckpt = load_checkpoint(args.vqvae_ckpt, device)
     K = vq_ckpt["model_kwargs"]["num_embeddings"]
     print(f"Loaded VQ-VAE from {args.vqvae_ckpt} (epoch {vq_ckpt['epoch']}, val SSIM {vq_ckpt['val_metric']:.4f})")

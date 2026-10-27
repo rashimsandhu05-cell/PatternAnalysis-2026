@@ -46,7 +46,7 @@ flowchart LR
 |---|---|
 | `dataset.py` | Loads Nifti slices, centre-crops to 256×128, normalises each slice, caches tensors, builds DataLoaders |
 | `modules.py` | VQ-VAE (encoder, EMA vector quantiser, decoder), VAE baseline, Gated PixelCNN prior. Running it executes the self-tests |
-| `train.py` | Training/validation loops for all three models, checkpoints, curves and logs of time and peak GPU memory |
+| `train.py` | Training and validation loops for all three models, checkpoints (best by validation score), loss/metric curves, time and peak GPU memory logging, and a single test-set evaluation of the selected checkpoint |
 | `predict.py` | Loads trained weights and runs the test-set evaluation, failure analysis, sampling, memorisation audit, interpolation and profiling |
 | `utils.py` | SSIM (validated against scikit-image), PSNR, masked SSIM, seeding and figure helpers |
 | `data_audit.py` | Pre-training dataset audit (shapes, intensities, labels, image/mask pairing, patient leakage) |
