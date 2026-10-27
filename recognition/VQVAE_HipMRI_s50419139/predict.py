@@ -28,6 +28,11 @@ Tasks (all write to --out, default results/):
   generalisation  Overfitting check: reconstruction SSIM/PSNR on the train, validate
                 and test splits side by side. A small train-test gap means the
                 autoencoder generalises to unseen patients. -> generalisation.json
+  cohort        Uncurated grids from several random seeds; coverage and density of the
+                generated cohort against real test slices (real unseen patients as the
+                reference); autopsy of the worst generated slice for five flaw types,
+                with how often each flaw occurs. -> samples_seeds_*.png,
+                sample_autopsy.png, cohort.json
   profile       Parameters, inference latency/throughput, generation time and peak
                 GPU memory, plus training cost from outputs/*/summary.json.
                 -> profile.json
@@ -52,6 +57,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from dataset import DEFAULT_CACHE, DEFAULT_ROOT, IMG_H, IMG_W, LABEL_NAMES, HipMRISlices
 from modules import count_parameters
@@ -59,7 +65,7 @@ from train import load_checkpoint
 from utils import (_plt, _show, get_device, masked_ssim, peak_memory_mb, psnr, reset_peak_memory, save_image_grid,
                    save_json, seed_everything, ssim)
 
-ALL_TASKS = ["evaluate", "failures", "generate", "memorisation", "interpolate", "profile", "generalisation"]
+ALL_TASKS = ["evaluate", "failures", "generate", "memorisation", "interpolate", "profile", "generalisation", "cohort"]
 ORGANS = {3: "bladder", 4: "rectum", 5: "prostate"}
 ORGAN_COLOURS = {3: "gold", 4: "magenta", 5: "red"}
 MIN_ORGAN_PIXELS = 50  # ignore slices where an organ is only a few pixels (unstable SSIM)
@@ -78,6 +84,10 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=1.0, help="PixelCNN sampling temperature")
     p.add_argument("--n-failures", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seeds", default="1,2,3", help="cohort task: seeds for the uncurated grids")
+    p.add_argument("--per-seed", type=int, default=8, help="cohort task: samples per seed")
+    p.add_argument("--compare-samples", default="",
+                   help='cohort task: extra sample sets, e.g. "vae (epoch 150)=results/vae_last/samples_vae.pt"')
     args = p.parse_args()
     args.tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     unknown = set(args.tasks) - set(ALL_TASKS)
@@ -574,6 +584,202 @@ def task_generalisation(models, args, device, out, report):
 
 
 # --------------------------------------------------------------------------- #
+# Task: cohort (multi-seed grids, coverage/density, generated-sample autopsy)
+# --------------------------------------------------------------------------- #
+def pooled_features(x, factor=4):
+    """Downsample to 64x32 and flatten: a simple, model-independent feature space
+    (no pretrained network is available offline, and ImageNet features fit MR poorly)."""
+    return F.avg_pool2d(x.float(), factor).flatten(1)
+
+
+@torch.no_grad()
+def pairwise_dist(a, b, device, bs=512):
+    """Euclidean distances between rows of a (N, D) and b (M, D), returned on the CPU."""
+    B = b.to(device)
+    b2 = B.pow(2).sum(1)
+    out = []
+    for i in range(0, len(a), bs):
+        A = a[i:i + bs].to(device)
+        d2 = A.pow(2).sum(1, keepdim=True) + b2 - 2 * A @ B.t()
+        out.append(d2.clamp(min=0).sqrt().cpu())
+    return torch.cat(out)
+
+
+def coverage_density(fake_f, real_f, real_case, device, k=5):
+    """Coverage and density (Naeem et al., 2020) of a fake set against real reference slices.
+
+    Each real slice gets a neighbourhood radius equal to the distance to its k-th
+    nearest real slice *from a different patient* (otherwise near-identical
+    slices of the same patient would make every radius tiny).
+    Coverage = fraction of real slices with at least one fake slice inside their radius.
+    Density  = average number of real neighbourhoods each fake slice falls in, divided by k.
+    """
+    d_rr = pairwise_dist(real_f, real_f, device)
+    d_rr[real_case[:, None] == real_case[None, :]] = float("inf")
+    radii = d_rr.kthvalue(k, dim=1).values
+    inside = pairwise_dist(fake_f, real_f, device) < radii[None, :]   # (n_fake, n_real)
+    return {"coverage": inside.any(0).float().mean().item(),
+            "density": inside.float().sum().item() / (k * len(fake_f))}
+
+
+LAPLACIAN = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).view(1, 1, 3, 3)
+
+
+def laplacian_energy(x):
+    """Mean absolute Laplacian: high-frequency / checkerboard energy per slice."""
+    return F.conv2d(x.float(), LAPLACIAN, padding=1).abs().flatten(1).mean(1)
+
+
+def edge_stripe(x):
+    """Bright thin line at the left/right image border with a darker band inside it.
+    Axis -2 (length 256) is the displayed horizontal axis."""
+    x = x.float()[:, 0]
+    right = x[:, -2:, :].mean((1, 2)) - x[:, -10:-2, :].mean((1, 2))
+    left = x[:, :2, :].mean((1, 2)) - x[:, 2:10, :].mean((1, 2))
+    return torch.maximum(right, left)
+
+
+def asymmetry(x):
+    """Mean absolute difference between a slice and its left-right mirror image."""
+    return (x.float() - x.float().flip(-2)).abs().flatten(1).mean(1)
+
+
+def within_nn(imgs, device):
+    """Distance from each slice to the closest *other* slice in the same set."""
+    f = pooled_features(imgs)
+    d = pairwise_dist(f, f, device)
+    d.fill_diagonal_(float("inf"))
+    return d.min(1).values
+
+
+@torch.no_grad()
+def task_cohort(models, prior, args, test, device, out, report):
+    plt = _plt()
+    train = HipMRISlices("train", args.root, args.cache_dir)
+    val = HipMRISlices("validate", args.root, args.cache_dir)
+    seeds = [int(s) for s in args.seeds.split(",")]
+
+    # 1. Uncurated grids from several random seeds
+    if prior is not None:
+        h, w = models["vqvae"].latent_shape(IMG_H, IMG_W)
+        rows = []
+        for sd in seeds:
+            torch.manual_seed(sd)
+            codes = prior.sample(args.per_seed, h, w, device, args.temperature)
+            rows.append(models["vqvae"].decode_indices(codes).float().clamp(0, 1).cpu())
+        fig, axes = plt.subplots(len(seeds), args.per_seed, figsize=(2.0 * args.per_seed, 1.25 * len(seeds)),
+                                 squeeze=False)
+        for r, (sd, imgs) in enumerate(zip(seeds, rows)):
+            for c in range(args.per_seed):
+                _show(axes[r, c], imgs[c])
+            axes[r, 0].set_title(f"seed {sd}", fontsize=7, loc="left")
+        fig.suptitle(f"VQ-VAE + PixelCNN: uncurated samples from {len(seeds)} seeds (T={args.temperature})",
+                     fontsize=9)
+        fig.tight_layout()
+        fig.savefig(out / "samples_seeds_vqvae.png", dpi=130)
+        plt.close(fig)
+    if "vae" in models:
+        rows = []
+        for sd in seeds:
+            torch.manual_seed(sd)
+            rows.append(models["vae"].sample(args.per_seed, IMG_H, IMG_W, device).float().clamp(0, 1).cpu())
+        save_image_grid(torch.cat(rows), out / "samples_seeds_vae.png", nrow=args.per_seed,
+                        title=f"VAE: uncurated samples from seeds {args.seeds} (one row per seed)")
+
+    # 2. Coverage / density against the real test slices, plus within-set diversity
+    samples = load_samples(out)
+    for spec in filter(None, args.compare_samples.split(";")):
+        label, path = spec.split("=", 1)
+        if Path(path.strip()).exists():
+            samples[label.strip()] = torch.load(path.strip(), weights_only=False)["images"].float()
+    test_f, test_case = pooled_features(test.images), test.case_ids
+    g = torch.Generator().manual_seed(0)
+    sets = {
+        "real: validation patients (unseen)": val.images[torch.randperm(len(val), generator=g)[:256]],
+        "real: training patients": train.images[torch.randperm(len(train), generator=g)[:256]],
+        **{f"generated: {k}": v for k, v in samples.items()},
+    }
+    cov = {label: coverage_density(pooled_features(imgs), test_f, test_case, device) for label, imgs in sets.items()}
+    div = {label: within_nn(imgs, device).median().item() for label, imgs in sets.items()}
+
+    # 3. Autopsy of flawed generations (VQ-VAE samples)
+    autopsy = []
+    if "vqvae" in samples:
+        gen = samples["vqvae"]
+        real = test.images.float()
+        d_tr, j_tr = nearest_neighbours(gen, train.images, device)
+        d_real, _ = nearest_neighbours(real, train.images, device)
+        real_f = pooled_features(real)
+        d_cross = pairwise_dist(real_f, real_f, device)
+        d_cross[test_case[:, None] == test_case[None, :]] = float("inf")
+        criteria = [
+            ("Border stripe artefact", edge_stripe(gen), edge_stripe(real), "high"),
+            ("Left-right asymmetry", asymmetry(gen), asymmetry(real), "high"),
+            ("High-frequency / checkerboard energy", laplacian_energy(gen), laplacian_energy(real), "high"),
+            ("Out-of-distribution (far from all training slices)", d_tr, d_real, "high"),
+            ("Near-duplicate of another sample (mode drop)", within_nn(gen, device), d_cross.min(1).values, "low"),
+        ]
+        fig, axes = plt.subplots(len(criteria), 3, figsize=(9.5, 1.8 * len(criteria)), squeeze=False)
+        for r, (name, score_gen, score_real, direction) in enumerate(criteria):
+            i = int(score_gen.argmax() if direction == "high" else score_gen.argmin())
+            entry = {"flaw": name, "sample": i, "score": score_gen[i].item()}
+            if direction == "high":
+                ref = torch.quantile(score_real, 0.99).item()
+                entry["real_reference"] = f"99th pct of real = {ref:.3f}"
+                entry["prevalence"] = (score_gen > ref).float().mean().item()
+            else:
+                ref = torch.quantile(score_real, 0.01).item()
+                entry["real_reference"] = f"1st pct of real cross-patient NN = {ref:.3f}"
+                entry["prevalence"] = (score_gen < ref).float().mean().item()
+            autopsy.append(entry)
+
+            _show(axes[r, 0], gen[i])
+            axes[r, 0].set_title(f"{name}\nsample {i}, score {entry['score']:.3f}", fontsize=6)
+            ax = axes[r, 1]
+            if name.startswith("Near-duplicate"):
+                d = pairwise_dist(pooled_features(gen[i:i + 1]), pooled_features(gen), device)[0]
+                d[i] = float("inf")
+                twin = int(d.argmin())
+                _show(ax, gen[twin])
+                ax.set_title(f"closest other sample ({twin})", fontsize=6)
+            else:
+                if name.startswith("Left-right"):
+                    m, t = (gen[i] - gen[i].flip(-2)).abs().squeeze(), "|sample - mirror image|"
+                elif name.startswith("High-frequency"):
+                    m, t = F.conv2d(gen[i:i + 1].float(), LAPLACIAN, padding=1).abs()[0, 0], "|Laplacian|"
+                else:
+                    m, t = (gen[i] - train.images[j_tr[i]].float()).abs().squeeze(), "|sample - nearest training slice|"
+                ax.imshow(m.T.numpy(), cmap="inferno", origin="lower", vmin=0, vmax=0.6)
+                ax.axis("off")
+                ax.set_title(t, fontsize=6)
+            _show(axes[r, 2], train.images[j_tr[i]])
+            axes[r, 2].set_title(f"nearest training slice (RMSE {d_tr[i]:.3f})", fontsize=6)
+        fig.suptitle("Autopsy: the worst generated slice for each flaw type (VQ-VAE, uncurated pool of samples)",
+                     fontsize=9)
+        fig.tight_layout()
+        fig.savefig(out / "sample_autopsy.png", dpi=150)
+        plt.close(fig)
+
+    save_json({"coverage_density": cov, "within_set_nn_median": div, "autopsy": autopsy,
+               "seeds": seeds, "per_seed": args.per_seed}, out / "cohort.json")
+    lines = ["| Set (256 slices) vs real test slices | Coverage | Density | Median NN distance within set |",
+             "|---|---|---|---|"]
+    for label in cov:
+        lines.append(f"| {label} | {cov[label]['coverage']:.3f} | {cov[label]['density']:.3f} | {div[label]:.3f} |")
+    lines += ["", "| Flaw (VQ-VAE samples) | Worst sample | Score | Real reference | Prevalence in samples |",
+              "|---|---|---|---|---|"]
+    for e in autopsy:
+        lines.append(f"| {e['flaw']} | {e['sample']} | {e['score']:.3f} | {e['real_reference']} | {e['prevalence']:.1%} |")
+    report.add("Cohort fidelity, diversity and sample autopsy", "\n".join(lines) +
+               "\n\nCoverage/density: Naeem et al. (2020), in a 64x32 average-pooled pixel space, with "
+               "neighbourhood radii from the 5th nearest real test slice of a different patient. "
+               "Prevalence: fraction of generated slices beyond the real 99th percentile (or below the real 1st "
+               "percentile for near-duplicates). Figures: samples_seeds_vqvae.png, samples_seeds_vae.png, "
+               "sample_autopsy.png")
+    print("\n".join(lines))
+
+
+# --------------------------------------------------------------------------- #
 # Task: profile
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -702,6 +908,8 @@ def main():
         task_profile(models, prior, args, test, device, out, report)
     if "generalisation" in args.tasks:
         task_generalisation(models, args, device, out, report)
+    if "cohort" in args.tasks:
+        task_cohort(models, prior, args, test, device, out, report)
     print(f"Done. Results in {out}/ (summary: {out / 'report.md'})")
 
 
