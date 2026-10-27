@@ -277,9 +277,10 @@ def train_autoencoder(args, device, out):
             samples = model.sample(args.n_samples, IMG_H, IMG_W, device).float().cpu()
         save_image_grid(samples, out / "samples.png", title="VAE samples, z ~ N(0, I)")
 
-    if not (out / "best.pt").exists():
-        # Only possible when training is shorter than the VAE's KL warm-up
-        # (e.g. --smoke): fall back to the final epoch so later steps still work.
+    if best == -math.inf:
+        # No epoch of *this* run was eligible: only possible when training is
+        # shorter than the VAE's KL warm-up (e.g. --smoke). Overwrite any stale
+        # best.pt from an earlier run with the final epoch so later steps work.
         print(f"[{args.model}] no epoch was eligible for best.pt (training shorter than KL warm-up); "
               f"using the last epoch", flush=True)
         best = history[-1]["val_ssim"]
