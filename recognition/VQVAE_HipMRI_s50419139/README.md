@@ -89,6 +89,9 @@ HipMRI 2D (256×128 coronal slices), with the provided patient-level splits (31 
 
 Before writing the data loader, the HipMRI 2D slice dataset (`keras_slices_data` on Rangpur) was audited with `data_audit.py`, which checks slice counts, shapes, intensity ranges, label balance, image/mask pairing and patient overlap between splits.
 
+![Sample slices](images/sample_slices.png)
+*Random raw slices from each split, with segmentation-mask contours, as saved by `data_audit.py`.*
+
 | Split | Slices | Patients | Slice shapes |
 |---|---|---|---|
 | Train | 11,460 | 31 | 256×128 (11,400), 256×144 (60) |
@@ -356,8 +359,22 @@ Three failures were caught by self-tests and CPU smoke runs before they could af
 1. **Fine, high-contrast speckled texture (patient 42, week 0, slices 32–39).** All five worst whole-slice reconstructions (SSIM 0.921–0.923) are consecutive slices from one scan session, with mottled bowel loops in the upper pelvis and small bright speckles around and just above the prostate. In the final model the error maps concentrate on that speckled region, which is reconstructed as smoother, lower-contrast texture, while the rest of the slice has little error. Each code represents a 4×4-pixel patch drawn from a 512-entry codebook, and this high-frequency, patient-specific texture is rare in training data, so it is approximated by smoother codes. The same slices were the worst in run A, where they dropped to SSIM 0.65 and the error was spread over the whole slice.
 2. **Prostate detail.** The worst prostate reconstructions (prostate SSIM 0.786–0.824) are either small (97–198 pixels), where a few misplaced pixels dominate the score, or large with heterogeneous internal texture (691 pixels, patient 42), where fine internal structure is smoothed. Run A failed badly on the same kind of slice (prostate SSIM as low as 0.205); the final model keeps the prostate outline and most of its internal texture.
 3. **Slice position.** Whole-slice SSIM falls steadily with slice index (from about 0.96 to about 0.93; in run A from about 0.80 to about 0.70), as slices further through the volume contain more bowel and fine structure. Patient 42 dips to about 0.92 at slices 32–40, the speckled slices above. Inside the prostate, SSIM drifts down slightly as the gland gets larger (more internal texture to reproduce), with patient 41 consistently lowest.
-4. **Sample artefacts.** A few generated slices have a thin bright vertical line along the right image edge, or asymmetric pelvic bones (visible in the sample grid). They do not appear in reconstructions, so they come from the prior, not the decoder. A likely cause is single unlikely codes sampled at the right-hand border, where a raster-order PixelCNN has the least context about what lies beyond the edge.
+4. **Flawed generations.** See 6.4.3 below.
 5. **Overfitting of the prior.** With only 31 training patients, PixelCNN validation NLL reached its minimum early and then rose, even with dropout. The best-validation checkpoint is used, but more patients (or conditioning on slice position) would be the most direct fix for both coherence and memorisation risk.
+
+#### 6.4.3 Autopsy of flawed generations
+
+The uncurated grid of final VQ-VAE samples (`images/final_samples_vqvae.png`, Section 6.1; 32 samples, rows 1–4 and columns 1–8 as displayed) was inspected for generation failures. None of these flaws appears in reconstructions of real slices, so all of them come from the PixelCNN prior, not from the decoder.
+
+| # | Flaw | Where in the grid | How common (of 32) | Diagnosis |
+|---|---|---|---|---|
+| G1 | **Border stripe:** a thin bright vertical line along the right image edge, separated from the body by a dark gap | row 1 col 6; row 2 col 3; row 2 col 8; row 4 col 4 | about 4 | The PixelCNN generates codes in raster order over the 64×32 grid. Because slices are displayed with the 256-pixel axis horizontal, this runs **left to right across the displayed slice**, so the right edge is generated last. Its codes are conditioned on the whole slice, but only on the image *to their left*. A "bright body-edge" code that is common at the border in training (where subcutaneous fat touches the edge) can be sampled even when the generated body ends earlier. The stripe never appears on the left edge, which supports this raster-order explanation. |
+| G2 | **Fragmented / doubled bladder:** the bright bladder is split into a main blob and a smaller detached fragment | row 1 col 1 | 1 | The bladder is the brightest, most distinctive structure, spread over several code columns. If the prior closes the bright region and then reopens it a few code steps later, a second fragment appears. Bladder shape is a long-range constraint that a code-by-code model only learns implicitly. |
+| G3 | **Distorted tissue margins / no recognisable bones:** a chaotic, washed-out pelvis with streaky bright tissue, where the femoral heads and pelvic ring cannot be identified | row 3 col 7; row 4 col 2 | about 2–3 | Error compounding: once a few early codes are unlikely (sampling at T = 1.0 deliberately keeps diversity), later codes are conditioned on an unusual context the prior saw rarely, and the slice drifts away from any training anatomy. Samples like these are the most likely source of the far right tail of the memorisation histogram (RMSE 0.25–0.35, far from every training slice). |
+| G4 | **Left–right inconsistency:** a structure present on one side has no plausible counterpart on the other (e.g. a large dark region on one side only) | row 4 col 3 | about 2 | A consequence of the same left-to-right generation order: the right half is generated conditioned on the left half, but nothing forces the mirror-symmetric structure of the pelvis. Mismatches accumulate toward the right. |
+| G5 | **Mode drops / duplicates** (checked, not found) | none | 0 | No two samples in the grid are near-copies of each other, and codebook perplexity stays at about 374/512, so the generator does not collapse to a few modes (AC4). |
+
+Roughly three-quarters of the samples show none of these flaws. The flaws point to concrete fixes: generation order or conditioning that gives the model global context (e.g. a coarse-to-fine hierarchical prior as in VQ-VAE-2, or conditioning on slice position), and filtering out samples that fall far from every real slice (G3) before release.
 
 ### 6.5 Recommendation to Project Manager
 
