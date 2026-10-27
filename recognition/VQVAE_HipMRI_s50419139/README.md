@@ -338,6 +338,24 @@ Lowering T makes samples smoother and more "typical" (higher SSIM to real slices
 
 ![Run A samples at T=0.7](images/runA_samples_vqvae_T0.70.png)
 
+- **Distributional coverage.** As a substitute for FID, coverage and density (Naeem et al., 2020) were computed against the 540 real test slices, in a model-independent feature space (slices average-pooled to 64×32). Each real slice's neighbourhood radius is the distance to its 5th-nearest real slice *from a different patient*. Coverage is the fraction of real test slices with at least one sample inside their neighbourhood; density is how many real neighbourhoods each sample falls into on average, divided by 5. 256 real slices from other splits give the reference values (`predict.py --tasks cohort`):
+
+| 256 slices from… | Coverage ↑ | Density | Median distance to nearest other slice in the set (diversity) |
+|---|---|---|---|
+| Real: training patients (31 patients) | 0.967 | 6.30 | 6.43 |
+| Real: validation patients (4 patients) | 0.493 | 4.78 | 2.20 |
+| **Generated: VQ-VAE final** | **0.946** | **5.80** | **7.22** |
+| Generated: VAE (epoch-2 checkpoint) | 0.009 | 0.09 | 6.61 |
+| Generated: VAE (fully trained, epoch 150) | 0.061 | 1.02 | 6.00 |
+
+The VQ-VAE samples cover **almost as much of the real test anatomy as real training slices do** (0.946 vs 0.967), and land in real neighbourhoods about as densely (5.80 vs 6.30). Both VAEs cover almost nothing (≤ 6%). The 4 validation patients cover only 0.49, because 4 people span less anatomical variety than 31: coverage measures *breadth*, and the VQ-VAE's breadth matches a 31-patient real sample. The samples are also *more* spread out than real training slices (median nearest-other distance 7.22 vs 6.43), so there is **no mode collapse**. Real sets drawn from few patients (validation: 2.20) are much more self-similar, because consecutive slices of one patient look alike.
+
+![Samples from three seeds](images/cohort_samples_seeds_vqvae.png)
+*Uncurated VQ-VAE samples from three different random seeds (8 each). Every seed produces a similar mix of coherent pelvic slices and occasional flawed ones, so the main sample grid is representative and not a lucky seed.*
+
+![VAE samples from three seeds](images/cohort_samples_seeds_vae.png)
+*Fully trained VAE, the same three seeds: no anatomy for any seed.*
+
 - **Plausibility metric: a lesson.** The midpoint review proposed "median SSIM of each sample to its nearest real slice > 0.6" (AC2). This proved unreachable even for real data: real unseen slices reach only 0.271 against their nearest training slice, because anatomy, positioning and slice depth differ between patients. AC2 was therefore revised to compare against that real-data reference. Even so, nearest-neighbour SSIM disagrees with visual quality. The final model's samples look **far more** anatomically plausible than run A's, yet score lower (0.253 vs 0.293), because realistic fine texture that does not align pixel-for-pixel is penalised more than smooth, generic texture. Nearest-neighbour SSIM is not a reliable plausibility measure, so visual inspection was used as the primary evidence. (A learned-feature metric such as FID was not used: it needs a pretrained network that could not be downloaded on the cluster, and ImageNet features are themselves a questionable fit for MR.)
 ### 6.4 Failure Case Autopsy
 
@@ -374,6 +392,19 @@ The uncurated grid of final VQ-VAE samples (`images/final_samples_vqvae.png`, Se
 | G4 | **Left–right inconsistency:** a structure present on one side has no plausible counterpart on the other (e.g. a large dark region on one side only) | row 4 col 3 | about 2 | A consequence of the same left-to-right generation order: the right half is generated conditioned on the left half, but nothing forces the mirror-symmetric structure of the pelvis. Mismatches accumulate toward the right. |
 | G5 | **Mode drops / duplicates** (checked, not found) | none | 0 | No two samples in the grid are near-copies of each other, and codebook perplexity stays at about 374/512, so the generator does not collapse to a few modes (AC4). |
 
+**Automatic check over all 256 samples.** To check how common each flaw is, and not just whether it exists, each slice was scored for five flaw types. For every flaw the worst sample is shown below, and its prevalence is the fraction of the 256 samples that is more extreme than 99% of real test slices:
+
+| Flaw | Score used | Worst sample | Prevalence in 256 samples | Note |
+|---|---|---|---|---|
+| Border stripe (G1) | brightness of the 2 border columns minus the 8 columns inside them | #239 (0.534) | 56%* | *Real slices never show a stripe (their 99th percentile is 0), so any positive score counts, including invisible ones. The visual count in the grid (about 4 of 32, ~12%) is the realistic prevalence of a *visible* stripe. |
+| Left–right asymmetry (G4) | mean \|slice − mirror image\| | #254 (0.374) | 8.2% | Real 99th percentile 0.238. |
+| High-frequency / checkerboard energy | mean \|Laplacian\| | #76 (0.112) | 1.6% | Real 99th percentile 0.104. Checkerboard-type artefacts are **rare**. Even in the worst sample, the |Laplacian| map shows that the excess energy sits in a dotted stripe along the right edge (flaw G1), not in a grid pattern from the decoder's transposed convolutions. |
+| Out of distribution (G3) | RMSE to nearest training slice | #254 (0.347) | 12.9% | Real 99th percentile 0.222. The same sample (#254) is both the most asymmetric and the furthest from all training data: bright tissue fills the whole field and the body is off-centre. Flaws cluster in a minority of samples whose sampling went off-track early. |
+| Near-duplicate (G5) | distance to nearest other sample | #14 (5.39) | 18%† | †Measured against the wrong reference (cross-patient distances between test slices, 1st percentile 6.30). Against the fair reference (256 real training slices, median 6.43), samples are *more* spread out (median 7.22), so this is not evidence of mode collapse. The "closest pair" (#14 and #206) are two *different* mid-pelvis slices with a bladder (different bladder shape, contrast and bone outline): the most common slice type, not copies. |
+
+![Automatic sample autopsy](images/cohort_sample_autopsy.png)
+*For each flaw type: the worst generated slice (left), a diagnostic map (middle: mirror difference, Laplacian, error to the nearest training slice, or the closest other sample) and the nearest training slice (right).*
+
 Roughly three-quarters of the samples show none of these flaws. The flaws point to concrete fixes: generation order or conditioning that gives the model global context (e.g. a coarse-to-fine hierarchical prior as in VQ-VAE-2, or conditioning on slice position), and filtering out samples that fall far from every real slice (G3) before release.
 
 ### 6.5 Recommendation to Project Manager
@@ -383,7 +414,7 @@ Roughly three-quarters of the samples show none of these flaws. The flaws point 
 | Acceptance criterion | Final result | Verdict |
 |---|---|---|
 | AC1 Fidelity | Test SSIM 0.944 (prostate 0.874) vs matched VAE 0.688 | ✅ Met |
-| AC2 Plausibility | Visually coherent pelvic anatomy in most samples; nearest-neighbour SSIM 0.253 vs real reference 0.271 (a weak metric, see 6.3) | ⚠️ Largely met visually, not by the metric |
+| AC2 Plausibility | Visually coherent pelvic anatomy in about three-quarters of samples; coverage of real test anatomy 0.946 vs 0.967 for real training slices; nearest-neighbour SSIM 0.253 vs real reference 0.271 (a weak metric, see 6.3) | ⚠️ Largely met (visually and by coverage), not by the SSIM metric |
 | AC3 No memorisation | 2.7% below τ (real patients: 5%); code overlap at real-patient level; no visual copies | ✅ Met |
 | AC4 Diversity | Codebook perplexity 374 of 512 at the end of training (target > 256); uncurated samples vary in slice depth, bladder size and anatomy, with no mode collapse | ✅ Met |
 | AC5 Resources | Autoencoder 1.3 GB / 25 min ✅; prior 10.9 GB (> 8 GB) and 4.4 s per slice (> 1 s) | ❌ Generation exceeds budget |
@@ -432,4 +463,5 @@ I take full responsibility for every line of code, every formula and every repor
 5. Z. Wang, A. C. Bovik, H. R. Sheikh and E. P. Simoncelli, "Image Quality Assessment: From Error Visibility to Structural Similarity," *IEEE Transactions on Image Processing*, 13(4), 2004.
 6. P. Dhariwal, H. Jun, C. Payne, J. W. Kim, A. Radford and I. Sutskever, "Jukebox: A Generative Model for Music," 2020. arXiv:2005.00341. (Random restarts of unused codes.)
 7. C. Meehan, K. Chaudhuri and S. Dasgupta, "A Non-Parametric Test to Detect Data-Copying in Generative Models," *AISTATS*, 2020. arXiv:2004.05675.
-8. J. Dowling and P. Greer, "Labelled weekly MR images of the male pelvis," CSIRO Data Collection, v2, 2021. doi:10.25919/45t8-p065.
+8. M. F. Naeem, S. J. Oh, Y. Uh, Y. Choi and J. Yoo, "Reliable Fidelity and Diversity Metrics for Generative Models," *ICML*, 2020. arXiv:2002.09797.
+9. J. Dowling and P. Greer, "Labelled weekly MR images of the male pelvis," CSIRO Data Collection, v2, 2021. doi:10.25919/45t8-p065.
