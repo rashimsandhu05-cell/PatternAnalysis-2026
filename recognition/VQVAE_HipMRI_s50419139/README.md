@@ -12,8 +12,8 @@ Prostate cancer radiotherapy research needs large sets of pelvic MR scans, but p
 
 A **VQ-VAE** (van den Oord et al., 2017) is an autoencoder whose latent space is *discrete*:
 
-1. **Encoder.** Three stride-2 convolutions and two residual blocks map a 1×256×128 slice to a 32×16 grid of 64-dimensional vectors $z_e$.
-2. **Vector quantiser.** Each vector is replaced by its nearest entry in a learned **codebook** of 512 vectors, $z_q = e_k$ with $k = \arg\min_j \lVert z_e - e_j \rVert_2$, so a slice becomes a 32×16 grid of integers.
+1. **Encoder.** Two stride-2 convolutions and two residual blocks map a 1×256×128 slice to a **64×32 grid** of 64-dimensional vectors $z_e$, so each vector describes a 4×4-pixel patch. (The first experiments used three stride-2 convolutions and a 32×16 grid; the ablation in Section 6.1 shows why the final model uses 64×32.)
+2. **Vector quantiser.** Each vector is replaced by its nearest entry in a learned **codebook** of 512 vectors, $z_q = e_k$ with $k = \arg\min_j \lVert z_e - e_j \rVert_2$, so a slice becomes a 64×32 grid of integers (2,048 codes).
 3. **Decoder.** It mirrors the encoder (residual blocks, then transposed convolutions and a sigmoid) to rebuild the slice from $z_q$.
 
 The training loss is
@@ -24,15 +24,15 @@ where sg is the stop-gradient operator and β = 0.25. The first term trains the 
 
 **Generating new slices** needs a model of *which code grids are plausible*. A **Gated PixelCNN** prior (van den Oord et al., 2016) is trained on the code grids of the training set to predict each code from the codes above and to the left of it. Sampling a grid code by code and passing it through the decoder produces a new slice.
 
-**Baseline.** A convolutional **VAE** (Kingma & Welling, 2014) uses the same encoder/decoder backbone, but its latent is a continuous Gaussian (8 channels on the same 32×16 grid). It is trained with summed squared error plus a KL term, with the KL weight warmed up over 5 epochs (Bowman et al., 2016), and it generates by decoding $z \sim \mathcal{N}(0, I)$. Because the backbone is shared, the comparison isolates the effect of discrete versus continuous latents.
+**Baseline.** A convolutional **VAE** (Kingma & Welling, 2014) uses the same encoder/decoder backbone, but its latent is a continuous Gaussian (8 channels on the same 64×32 grid). It is trained with summed squared error plus a KL term, with the KL weight warmed up over 5 epochs (Bowman et al., 2016), and it generates by decoding $z \sim \mathcal{N}(0, I)$. Because the backbone is shared, the comparison isolates the effect of discrete versus continuous latents.
 
 ```mermaid
 flowchart LR
-    X["MR slice<br/>1×256×128"] --> E["Encoder<br/>3× stride-2 conv<br/>+ residual blocks"]
-    E --> ZE["z_e<br/>64×32×16"]
+    X["MR slice<br/>1×256×128"] --> E["Encoder<br/>2× stride-2 conv<br/>+ residual blocks"]
+    E --> ZE["z_e<br/>64 channels × 64×32"]
     ZE --> Q{"Nearest code<br/>(512×64 codebook,<br/>EMA updates)"}
-    Q --> ZQ["z_q<br/>codes 32×16"]
-    ZQ --> D["Decoder<br/>residual blocks<br/>+ 3× transposed conv"]
+    Q --> ZQ["z_q<br/>codes 64×32"]
+    ZQ --> D["Decoder<br/>residual blocks<br/>+ 2× transposed conv"]
     D --> XH["Reconstruction<br/>1×256×128"]
     ZQ -. "code grids of training set" .-> P["Gated PixelCNN prior<br/>p(codes)"]
     P -. "sample new grid" .-> D
@@ -178,23 +178,34 @@ python train.py --model vae --smoke
 python train.py --model pixelcnn --smoke
 ```
 
-**4. Train on a GPU.** The PixelCNN must be trained after the VQ-VAE, because it learns the VQ-VAE's code grids:
+**4. Train on a GPU.** These are the exact commands for the final results. The PixelCNN must be trained after the VQ-VAE, because it learns the VQ-VAE's code grids:
 
 ```bash
-sbatch train.sh vqvae --epochs 150                  # -> outputs/vqvae/
-sbatch train.sh vae                                 # -> outputs/vae/
-sbatch --dependency=afterok:<vqvae_job_id> train.sh pixelcnn
+# Final VQ-VAE (64x32 code grid, SSIM loss term, 150 epochs), about 25 min on an A100
+V=$(sbatch --parsable train.sh vqvae --epochs 150 --ssim-weight 0.1 --n-down 2 --out-dir outputs/vqvae_d2_e150_ssim)
+# Matched VAE baseline (same three settings)
+sbatch train.sh vae --epochs 150 --ssim-weight 0.1 --n-down 2 --out-dir outputs/vae_d2_e150_ssim
+# PixelCNN prior on the final VQ-VAE's codes (31 layers cover all 64 rows), about 40 min, about 11 GB
+sbatch --dependency=afterok:$V train.sh pixelcnn --vqvae-ckpt outputs/vqvae_d2_e150_ssim/best.pt \
+       --prior-layers 31 --epochs 40 --out-dir outputs/pixelcnn_d2
 ```
 
-Useful options: `--out-dir`, `--epochs`, `--batch-size`, `--lr`, `--n-down` (3 gives a 32×16 code grid, 2 gives 64×32), `--ssim-weight`, `--num-embeddings`, `--prior-layers`, `--prior-kernel`. Each run writes `best.pt`, `last.pt`, `history.json`, `summary.json`, `curves.png` and `recon_latest.png` to its output folder.
+The run A configuration (Section 6.1) is the default: `sbatch train.sh vqvae`, `sbatch train.sh vae`, then `sbatch train.sh pixelcnn`.
 
-**5. Evaluate on the test split and generate samples:**
+Useful options: `--out-dir`, `--epochs`, `--batch-size`, `--lr`, `--n-down` (3 gives a 32×16 code grid, 2 gives 64×32), `--ssim-weight`, `--num-embeddings`, `--prior-layers`, `--prior-kernel`, `--prior-dropout`. Each run writes `best.pt`, `last.pt`, `history.json`, `summary.json`, `curves.png` and `recon_latest.png` to its output folder.
+
+**5. Evaluate on the test split and generate samples.** Final evaluation (all tasks; about 30–40 min, dominated by PixelCNN sampling):
 
 ```bash
-sbatch predict.sh                                   # all tasks -> results/
-sbatch predict.sh --tasks evaluate,failures         # a subset
-sbatch predict.sh --vqvae outputs/vqvae_e150/best.pt --out results/final
+F="--vqvae outputs/vqvae_d2_e150_ssim/best.pt --vae outputs/vae_d2_e150_ssim/best.pt --prior outputs/pixelcnn_d2/best.pt --out results/final"
+sbatch predict.sh $F
+sbatch predict.sh $F --tasks evaluate,failures      # or any subset of tasks
+# fully trained VAE (epoch 150), without the slow VQ-VAE sampling:
+sbatch predict.sh --tasks evaluate,generate,memorisation,generalisation --vqvae outputs/vqvae_d2_e150_ssim/best.pt \
+       --vae outputs/vae_d2_e150_ssim/last.pt --prior none --out results/vae_last
 ```
+
+Tasks: `evaluate`, `failures`, `generate`, `memorisation`, `interpolate`, `profile`, `generalisation`, `cohort` (see the docstring of `predict.py`). Sampling temperature is set with `--temperature` (default 1.0).
 
 `predict.py` writes all tables to `results/report.md` and figures to `results/`. Model weights, caches and results are not committed (see `.gitignore`); figures used in this README are copied to `images/`.
 
