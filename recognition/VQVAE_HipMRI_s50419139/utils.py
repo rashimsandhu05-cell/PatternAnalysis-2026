@@ -56,6 +56,7 @@ def _ssim_map_fp32(x, y, data_range):
     pad = SSIM_BORDER
 
     def blur(t):
+        """Gaussian-weighted local mean, with reflect padding so the output keeps the input size."""
         return F.conv2d(F.pad(t, (pad, pad, pad, pad), mode="reflect"), w)
 
     c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
@@ -93,12 +94,14 @@ def psnr(x, y, data_range: float = 1.0):
 # Reproducibility, device, memory
 # --------------------------------------------------------------------------- #
 def seed_everything(seed: int):
+    """Seed Python and PyTorch (CPU and all GPUs) for reproducible runs."""
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
 def get_device():
+    """Return the best available device: CUDA GPU, then Apple MPS, then CPU."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -107,6 +110,7 @@ def get_device():
 
 
 def reset_peak_memory(device):
+    """Reset the CUDA peak-memory counter (no-op on CPU/MPS)."""
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -119,6 +123,7 @@ def peak_memory_mb(device):
 
 
 def save_json(obj, path):
+    """Write an object to a JSON file with indentation."""
     Path(path).write_text(json.dumps(obj, indent=2))
 
 

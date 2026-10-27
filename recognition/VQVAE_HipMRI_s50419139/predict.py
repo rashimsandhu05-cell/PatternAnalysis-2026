@@ -59,7 +59,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from dataset import DEFAULT_CACHE, DEFAULT_ROOT, IMG_H, IMG_W, LABEL_NAMES, HipMRISlices
+from dataset import DEFAULT_CACHE, DEFAULT_ROOT, IMG_H, IMG_W, HipMRISlices
 from modules import count_parameters
 from train import load_checkpoint
 from utils import (_plt, _show, get_device, masked_ssim, peak_memory_mb, psnr, reset_peak_memory, save_image_grid,
@@ -72,6 +72,7 @@ MIN_ORGAN_PIXELS = 50  # ignore slices where an organ is only a few pixels (unst
 
 
 def parse_args():
+    """Command-line options: checkpoint paths, output folder, which tasks to run, sampling settings."""
     p = argparse.ArgumentParser(description="Evaluate trained models on the HipMRI 2D test split.")
     p.add_argument("--vqvae", default="outputs/vqvae/best.pt")
     p.add_argument("--vae", default="outputs/vae/best.pt")
@@ -100,6 +101,7 @@ def parse_args():
 # Helpers
 # --------------------------------------------------------------------------- #
 def sync(device):
+    """Wait for queued CUDA kernels so wall-clock timings are accurate (no-op on CPU)."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -112,10 +114,12 @@ def batched(fn, x, device, bs=64):
 
 @torch.no_grad()
 def reconstruct(model, images, device):
+    """Reconstruct a tensor of images in batches; returns CPU images clamped to [0, 1]."""
     return batched(lambda b: model(b)[0].float().clamp(0, 1), images, device)
 
 
 def mean_std(values):
+    """Mean, standard deviation and count of a list of numbers, ignoring NaNs."""
     v = torch.tensor([x for x in values if not math.isnan(x)], dtype=torch.float64)
     if len(v) == 0:
         return float("nan"), float("nan"), 0
@@ -123,10 +127,12 @@ def mean_std(values):
 
 
 def fmt(m, s, digits=3):
+    """Format 'mean ± std' for a Markdown table (n/a for NaN)."""
     return "n/a" if math.isnan(m) else f"{m:.{digits}f} ± {s:.{digits}f}"
 
 
 def write_csv(rows, path):
+    """Write a list of dictionaries (one per row) to a CSV file."""
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -152,6 +158,7 @@ class Report:
                 self.sections[title.strip()] = body.strip()
 
     def add(self, title, body):
+        """Add or replace a titled section and rewrite report.md."""
         self.sections[title] = body.strip()
         self.path.write_text(self.HEADER + "\n".join(f"## {t}\n\n{b}\n" for t, b in self.sections.items()))
 
@@ -161,6 +168,10 @@ class Report:
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def task_evaluate(models, test, device, out, report):
+    """Test-set reconstruction metrics for every model: whole-slice SSIM/PSNR/MSE,
+    SSIM inside bladder, rectum and prostate masks, and per-patient means.
+    Writes test_metrics.csv, test_summary.json and test_examples.png.
+    """
     x, masks = test.images.float(), test.masks
     recons, rows_by_model, summary = {}, {}, {}
     for name, model in models.items():
@@ -249,6 +260,7 @@ def task_evaluate(models, test, device, out, report):
 # Task: failures
 # --------------------------------------------------------------------------- #
 def failure_figure(indices, test, recons, rows, path, title):
+    """Figure of selected test slices: original with organ contours, each model's reconstruction, and the VQ-VAE error map."""
     plt = _plt()
     x, masks = test.images.float(), test.masks
     names = list(recons)
@@ -280,6 +292,7 @@ def failure_figure(indices, test, recons, rows, path, title):
 
 
 def task_failures(test, recons, rows, n, out, report):
+    """Find and plot the worst VQ-VAE reconstructions (whole slice and prostate), and plot SSIM against slice position and prostate size."""
     main = "vqvae"
     s = torch.tensor([r["ssim"] for r in rows[main]])
     worst = torch.argsort(s)[:n].tolist()
@@ -327,6 +340,7 @@ def task_failures(test, recons, rows, n, out, report):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def generate_vqvae(vqvae, prior, n, temperature, device, bs=64):
+    """Sample n code grids from the PixelCNN prior in batches and decode them; returns (images, codes)."""
     h, w = vqvae.latent_shape(IMG_H, IMG_W)
     imgs, codes = [], []
     for start in range(0, n, bs):
@@ -338,11 +352,13 @@ def generate_vqvae(vqvae, prior, n, temperature, device, bs=64):
 
 @torch.no_grad()
 def generate_vae(vae, n, device, bs=64):
+    """Sample n slices from the VAE by decoding z ~ N(0, I) in batches."""
     return torch.cat([vae.sample(min(bs, n - s), IMG_H, IMG_W, device).float().clamp(0, 1).cpu()
                       for s in range(0, n, bs)])
 
 
 def task_generate(models, prior, args, device, out):
+    """Generate the uncurated sample cohorts used by the audit and save them (.pt) with preview grids."""
     samples = {}
     if prior is not None:
         imgs, codes = generate_vqvae(models["vqvae"], prior, args.n_samples, args.temperature, device)
@@ -360,6 +376,7 @@ def task_generate(models, prior, args, device, out):
 
 
 def load_samples(out):
+    """Load previously generated sample cohorts from the output folder, if present."""
     samples = {}
     for name in ("vqvae", "vae"):
         f = out / f"samples_{name}.pt"
@@ -409,6 +426,10 @@ def max_code_overlap(queries, ref, device, bs=16):
 def task_memorisation(models, samples, test, train, device, out, report):
     # Training images stay float16 on the CPU (a float32 copy would need ~1.5 GB
     # extra RAM); nearest_neighbours converts each block to float32 on the device.
+    """Nearest-neighbour memorisation audit (see module docstring): distances and SSIM
+    from each sample to the training set, calibrated against real unseen test
+    slices, plus VQ-VAE code-grid overlap and a figure of the closest pairs.
+    """
     test_x, train_x = test.images.float(), train.images
     d_test, j_test = nearest_neighbours(test_x, train_x, device)
     tau = torch.quantile(d_test, 0.05).item()
@@ -517,6 +538,7 @@ def task_memorisation(models, samples, test, train, device, out, report):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def task_interpolate(models, test, device, out, steps=8):
+    """Decode linear interpolations between the latents of two test patients' slices."""
     cases = sorted({k[0] for k in test.keys})
     # Middle slice of the first two test patients (week 0 where available)
     picks = []
@@ -563,6 +585,7 @@ def split_metrics(model, images, device, bs=256):
 
 
 def task_generalisation(models, args, device, out, report):
+    """Overfitting check: mean reconstruction SSIM and PSNR on the train, validate and test splits."""
     splits = {}
     for split in ("train", "validate", "test"):
         ds = HipMRISlices(split, args.root, args.cache_dir)
@@ -654,6 +677,10 @@ def within_nn(imgs, device):
 
 @torch.no_grad()
 def task_cohort(models, prior, args, test, device, out, report):
+    """Cohort-level checks of the generator: uncurated grids from several seeds,
+    coverage/density against real test slices, and an autopsy of the worst
+    generated slice for five flaw types with their prevalence.
+    """
     plt = _plt()
     train = HipMRISlices("train", args.root, args.cache_dir)
     val = HipMRISlices("validate", args.root, args.cache_dir)
@@ -784,6 +811,7 @@ def task_cohort(models, prior, args, test, device, out, report):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def time_per_call(fn, device, repeats=20):
+    """Average wall-clock time of fn() over several calls, after one warm-up call."""
     fn()  # warm-up
     sync(device)
     t0 = time.perf_counter()
@@ -794,6 +822,7 @@ def time_per_call(fn, device, repeats=20):
 
 
 def task_profile(models, prior, args, test, device, out, report):
+    """Parameters, reconstruction latency/throughput, generation time and peak GPU memory, merged with training costs from summary.json."""
     x1 = test.images[:1].float().to(device)
     x64 = test.images[:64].float().to(device)
     prof = {}
@@ -838,6 +867,7 @@ def task_profile(models, prior, args, test, device, out, report):
     names = [n for n in models]
 
     def cell(n, key, f):
+        """One table cell, formatted, or n/a if the value is missing."""
         v = prof[n].get(key)
         return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f.format(v)
 

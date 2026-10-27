@@ -213,6 +213,7 @@ def save_sample_figure(image_reports, seg_reports, pairs, out_path, rng, n_cols=
 # Main
 # --------------------------------------------------------------------------- #
 def print_report(rep: dict):
+    """Print the audit results for one folder in a readable block."""
     print(f"\n[{rep['name']}]  ({'segmentation' if rep['is_seg'] else 'image'})")
     print(f"  files: {rep['n_files']}   patients: {rep['n_cases']}   "
           f"slices/patient: {rep['slices_per_case']}")
@@ -227,6 +228,7 @@ def print_report(rep: dict):
 
 
 def parse_args():
+    """Command-line options: dataset root, output folder, number of sampled slices, random seed."""
     p = argparse.ArgumentParser(description="Audit the HipMRI 2D slice dataset.")
     p.add_argument("--root", default=DEFAULT_ROOT, help="path to keras_slices_data")
     p.add_argument("--out", default="audit_outputs", help="output directory")
